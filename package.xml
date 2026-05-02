@@ -3,7 +3,7 @@
 <package format="3">
   <name>llm_humanoid</name>
   <version>0.1.0</version>
-  <description>LLM-driven humanoid agent in KIBOU/ISS environment (PROVIDENCE extension)</description>
+  <description>LLM-driven humanoid agent in KIBOU/ISS environment</description>
   <maintainer email="rhagura@gmail.com">hagura</maintainer>
   <license>MIT</license>
 

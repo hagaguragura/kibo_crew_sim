@@ -17,7 +17,7 @@ TIMEOUT=${1:-300}
 BAGDIR="$SPD_RUNS/demo_humanoid_a_to_b/$(date +%Y-%m-%d_%H-%M-%S)"
 KIBOU_WITH_HUMANOID="$SPD_WS/src/int-ball2_isaac_sim/int-ball2_isaac_sim/assets/KIBOU_with_humanoid.usd"
 
-echo "=== PROVIDENCE LLM-Humanoid A→B Demo ==="
+echo "=== LLM-Humanoid A→B Demo ==="
 echo "  Bag dir : $BAGDIR"
 echo "  Timeout : ${TIMEOUT}s"
 echo ""
