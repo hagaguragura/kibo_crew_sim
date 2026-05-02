@@ -1,0 +1,41 @@
+# LLM Humanoid デモ設定
+# KIBOU world座標: モジュール中心(20,0,0)、UpAxis=Z
+
+kibou_with_humanoid_usd: "$SPD_WS/src/int-ball2_isaac_sim/int-ball2_isaac_sim/assets/KIBOU_with_humanoid.usd"
+
+humanoid:
+  prim_path: "/World/Humanoid_01"
+  capsule_radius: 0.25
+  capsule_height: 1.1  # cylinderパート（全高1.6m）
+  capsule_axis: "Z"
+  # 初期位置: KIBOU内のハッチ前（world座標）
+  initial_position: [20.5, 0.5, 0.8]
+
+ros2:
+  odom_topic: "/humanoid_01/odom"
+  cmd_vel_topic: "/humanoid_01/cmd_vel"
+  publish_hz: 30
+
+goal_demo:
+  point_a:
+    x: 20.5
+    y: 0.5
+    z: 0.8
+    name: "Hatch"
+  point_b:
+    x: 20.5
+    y: 3.5
+    z: 0.8
+    name: "Experiment_Rack"
+
+navigation:
+  linear_speed: 0.3       # m/s
+  goal_threshold: 0.3     # m (到達判定距離)
+  decision_interval: 2.0  # seconds (LLM判断間隔)
+  timeout: 300            # seconds (デモタイムアウト)
+
+llm:
+  host: "http://localhost:11434"
+  model: "qwen2.5:latest"
+  max_tokens: 200
+  temperature: 0.7
