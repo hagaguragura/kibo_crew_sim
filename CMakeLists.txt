@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.8)
-project(llm_humanoid)
+project(kibo_crew_sim)
 
 find_package(ament_cmake REQUIRED)
 
