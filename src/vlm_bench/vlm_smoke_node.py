@@ -1,4 +1,4 @@
-"""ROS 2 node: subscribe /crew_01/image_raw once, call VLM, log result, shutdown."""
+"""ROS 2 node: subscribe /humanoid_01/image_raw once, call VLM, log result, shutdown."""
 
 import json
 import os
@@ -6,12 +6,10 @@ import sys
 from pathlib import Path
 from datetime import datetime
 
-import cv2
 import numpy as np
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image
-from cv_bridge import CvBridge
 from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent.parent.parent / ".env")
@@ -48,17 +46,23 @@ def _load_client():
         raise ValueError(f"Unknown SPD_VLM_PROVIDER: {VLM_PROVIDER}")
 
 
+def _imgmsg_to_bgr(msg: Image) -> np.ndarray:
+    img = np.frombuffer(msg.data, dtype=np.uint8).reshape((msg.height, msg.width, -1))
+    if msg.encoding in ("rgb8", "rgb"):
+        img = img[:, :, ::-1]  # RGB → BGR
+    return img
+
+
 class VLMSmokeNode(Node):
     def __init__(self):
         super().__init__("vlm_smoke_node")
-        self._bridge = CvBridge()
         self._client = _load_client()
         self._done = False
         self._sub = self.create_subscription(
-            Image, "/crew_01/image_raw", self._callback, 10)
+            Image, "/humanoid_01/image_raw", self._callback, 10)
         self.get_logger().info(
             f"VLMSmokeNode ready. provider={VLM_PROVIDER} model={VLM_MODEL or 'default'}. "
-            "Waiting for /crew_01/image_raw ...")
+            "Waiting for /humanoid_01/image_raw ...")
 
     def _callback(self, msg: Image):
         if self._done:
@@ -66,12 +70,12 @@ class VLMSmokeNode(Node):
         self._done = True
         self.get_logger().info("Image received. Calling VLM...")
 
-        img = self._bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+        img = _imgmsg_to_bgr(msg)
         result = self._client.describe(img, PROMPT)
 
         log_entry = {
             "timestamp": datetime.utcnow().isoformat(),
-            "image_topic": "/crew_01/image_raw",
+            "image_topic": "/humanoid_01/image_raw",
             "provider": VLM_PROVIDER,
             "model": VLM_MODEL or "default",
             **result,
