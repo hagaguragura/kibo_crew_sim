@@ -23,8 +23,10 @@ simulation_app.update()
 
 import omni.usd
 import omni.timeline
+import omni.graph.core as og
+import omni.replicator.core as rep
 from isaacsim.core.utils.stage import open_stage
-from pxr import Usd, UsdGeom, Gf
+from pxr import Usd, UsdGeom, UsdLux, Gf
 
 import rclpy
 from rclpy.node import Node
@@ -36,6 +38,9 @@ KIBOU_USD = os.path.expandvars(
 )
 HUMANOID_PATH = "/World/Humanoid_01"
 INITIAL_POS = np.array([20.5, 0.5, 0.8])
+
+CAM_PATH = f"{HUMANOID_PATH}/HeadMount/Camera_01"
+CAM_RES  = (640, 480)
 
 X_MIN, X_MAX = 19.0, 22.0
 Y_MIN, Y_MAX = -1.0, 5.0
@@ -98,6 +103,51 @@ def get_translate_op(stage, prim_path):
     return xformable.AddTranslateOp()
 
 
+def setup_camera(stage):
+    for i, pos in enumerate([(20.5, 0.0, 2.5), (20.5, 0.0, 0.5)]):
+        sl = UsdLux.SphereLight.Define(stage, f"/World/KibouInteriorLight_{i}")
+        sl.GetIntensityAttr().Set(5000)
+        sl.GetRadiusAttr().Set(0.1)
+        UsdGeom.Xformable(sl.GetPrim()).AddTranslateOp().Set(Gf.Vec3d(*pos))
+
+    head_mount = UsdGeom.Xform.Define(stage, f"{HUMANOID_PATH}/HeadMount")
+    UsdGeom.XformCommonAPI(head_mount).SetTranslate(Gf.Vec3d(0.0, 0.12, 1.63))
+
+    cam = UsdGeom.Camera.Define(stage, CAM_PATH)
+    cam.GetHorizontalApertureAttr().Set(20.955)
+    cam.GetFocalLengthAttr().Set(18.147)
+    cam.GetClippingRangeAttr().Set(Gf.Vec2f(0.05, 50.0))
+    UsdGeom.Xformable(cam.GetPrim()).AddRotateXOp().Set(90.0)
+
+    simulation_app.update()
+
+    rp = rep.create.render_product(CAM_PATH, CAM_RES)
+    keys = og.Controller.Keys
+    og.Controller.edit(
+        {"graph_path": f"{HUMANOID_PATH}/CameraGraph", "evaluator_name": "push"},
+        {
+            keys.CREATE_NODES: [
+                ("OnTick",    "omni.graph.action.OnPlaybackTick"),
+                ("ROSCtx",    "isaacsim.ros2.bridge.ROS2Context"),
+                ("CamHelper", "isaacsim.ros2.bridge.ROS2CameraHelper"),
+            ],
+            keys.CONNECT: [
+                ("OnTick.outputs:tick",    "CamHelper.inputs:execIn"),
+                ("ROSCtx.outputs:context", "CamHelper.inputs:context"),
+            ],
+            keys.SET_VALUES: [
+                ("CamHelper.inputs:topicName",         "/humanoid_01/image_raw"),
+                ("CamHelper.inputs:frameId",           "humanoid_01_camera"),
+                ("CamHelper.inputs:type",              "rgb"),
+                ("CamHelper.inputs:renderProductPath", rp.path),
+                ("ROSCtx.inputs:domain_id",            0),
+            ],
+        },
+    )
+    simulation_app.update()
+    print(f"[camera] /humanoid_01/image_raw ready ({CAM_RES[0]}x{CAM_RES[1]})")
+
+
 def main():
     if not os.path.exists(KIBOU_USD):
         print(f"ERROR: {KIBOU_USD} not found.")
@@ -108,6 +158,7 @@ def main():
     simulation_app.update()
 
     stage = omni.usd.get_context().get_stage()
+    setup_camera(stage)
     timeline = omni.timeline.get_timeline_interface()
     translate_op = get_translate_op(stage, HUMANOID_PATH)
 

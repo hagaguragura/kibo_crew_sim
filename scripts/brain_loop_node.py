@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Phase 5.1 / 6: LLMヒューマノイド脳（継続ループ）ROS2ノード。
+"""v0.4: Claude unified brain loop.
 
-Perception → Decision → Action を 2秒間隔で繰り返し、目標に到達したら停止。
+Perception (image_raw + odom) → Claude decide() → cmd_vel + decision topic
 
 使用方法:
     export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
     source /opt/ros/humble/setup.bash && source $SPD_WS/install/setup.bash
-    python3 brain_loop_node.py [--goal-y 3.5] [--interval 2.0]
+    python3 brain_loop_node.py [--cycle 3.0] [--timeout 300]
 
-[VERIFY] ヒューマノイドが数ステップで目標位置に到達して停止する
+[VERIFY] humanoid_01 が Int-Ball2 を視覚的に発見し 1m 以内に接近して停止する
 """
 import sys
 import os
@@ -16,243 +16,235 @@ import json
 import math
 import time
 import argparse
+import threading
 import logging
-import jsonlines
+from datetime import datetime
+from pathlib import Path
 
+import cv2
+import numpy as np
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
+from sensor_msgs.msg import Image
+from std_msgs.msg import String
 
-sys.path.insert(0, os.path.dirname(__file__))
-from ollama_client import OllamaClient
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../src/vlm_bench"))
+from dotenv import load_dotenv
+load_dotenv(os.path.join(os.path.dirname(__file__), "../.env"))
+from clients.claude_client import ClaudeVLMClient
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-ACTION_MAP = {
-    "forward":  ( 0.0,  1.0),
-    "backward": ( 0.0, -1.0),
-    "left":     (-1.0,  0.0),
-    "right":    ( 1.0,  0.0),
-    "stay":     ( 0.0,  0.0),
-}
+MISSION = (
+    "Find the missing Int-Ball2 (a small white spherical robot, ~30cm diameter). "
+    "Approach it within 1 meter. Reply 'stay' once you are close enough."
+)
 
-GOAL_THRESHOLD = 0.3   # m
-DEFAULT_GOAL = {"x": 20.5, "y": 3.5, "z": 0.8, "name": "Experiment_Rack"}
-
-
-def build_prompt(current_pos: dict, goal: dict, memory: str, step: int) -> str:
-    dx = goal["x"] - current_pos["x"]
-    dy = goal["y"] - current_pos["y"]
-    dist = math.sqrt(dx**2 + dy**2)
-
-    # 方向ヒント: LLMの誤判断を防ぐ
-    if abs(dy) >= abs(dx):
-        recommended = "forward" if dy > 0 else "backward"
-        hint = f"dy={dy:.3f} → goal is in {'POSITIVE' if dy>0 else 'NEGATIVE'} Y direction → use '{recommended}'"
-    else:
-        recommended = "right" if dx > 0 else "left"
-        hint = f"dx={dx:.3f} → goal is in {'POSITIVE' if dx>0 else 'NEGATIVE'} X direction → use '{recommended}'"
-
-    return f"""You are a human astronaut inside the KIBO module of the ISS.
-
-=== YOUR CURRENT STATE ===
-Position: ({current_pos['x']:.3f}, {current_pos['y']:.3f}, {current_pos['z']:.3f})
-Distance to goal: {dist:.3f} m
-
-=== YOUR GOAL ===
-Walk to position ({goal['x']:.3f}, {goal['y']:.3f}) named "{goal.get('name','Goal')}"
-Direction to goal: dx={dx:.3f}, dy={dy:.3f}
-
-=== NAVIGATION HINT ===
-{hint}
-IMPORTANT: "forward" moves +Y (increases Y). "backward" moves -Y (decreases Y).
-
-=== PREVIOUS MEMORY ===
-{memory if memory else 'No previous memory.'}
-
-=== AVAILABLE ACTIONS ===
-- "forward"  : move in +Y direction (Y increases)
-- "backward" : move in -Y direction (Y decreases)
-- "left"     : move in -X direction
-- "right"    : move in +X direction
-- "stay"     : remain at current position
-
-=== RESPOND IN JSON ONLY ===
-{{
-    "action": "forward" | "backward" | "left" | "right" | "stay",
-    "memory": "what you want to remember for the next step",
-    "reasoning": "brief explanation of your decision"
-}}
-
-Step: {step}
-"""
+def _make_twist(action: str) -> Twist:
+    t = Twist()
+    if action == "forward":
+        t.linear.x = 0.3
+    elif action == "backward":
+        t.linear.x = -0.2
+    elif action == "left":
+        t.angular.z = 0.5
+    elif action == "right":
+        t.angular.z = -0.5
+    return t
 
 
-def parse_llm_response(response: str) -> dict:
-    try:
-        start = response.find('{')
-        end = response.rfind('}')
-        if start != -1 and end != -1:
-            return json.loads(response[start:end+1])
-    except json.JSONDecodeError:
-        pass
-    for action in ACTION_MAP:
-        if action in response.lower():
-            return {"action": action, "memory": "", "reasoning": response[:100]}
-    return {"action": "stay", "memory": "", "reasoning": "parse failed"}
+def _imgmsg_to_bgr(msg: Image) -> np.ndarray:
+    img = np.frombuffer(msg.data, dtype=np.uint8).reshape((msg.height, msg.width, -1))
+    if msg.encoding in ("rgb8", "rgb"):
+        img = img[:, :, ::-1].copy()
+    return img
 
 
 class BrainLoopNode(Node):
-    def __init__(self, llm: OllamaClient, goal: dict, speed: float,
-                 interval: float, log_path: str):
+    def __init__(self, claude: ClaudeVLMClient, cycle_sec: float,
+                 log_dir: Path, use_two_stage: bool):
         super().__init__("brain_loop_node")
-        self.llm = llm
-        self.goal = goal
-        self.speed = speed
-        self.interval = interval
-        self.log_path = log_path
+        self.claude = claude
+        self.cycle_sec = cycle_sec
+        self.log_dir = log_dir
+        self.use_two_stage = use_two_stage
 
-        self.current_pos = None
-        self.memory = ""
-        self.step = 0
+        self._img_lock = threading.Lock()
+        self._latest_img: np.ndarray | None = None
+        self._img_stamp: float = 0.0
+
+        self.odom_pos = {"x": 0.0, "y": 0.0, "z": 0.0}
+        self.memory: list[str] = []
+        self.cycle = 0
         self.reached = False
+        self.total_cost = 0.0
 
-        self.pub = self.create_publisher(Twist, "/humanoid_01/cmd_vel", 10)
-        self.sub = self.create_subscription(
-            Odometry, "/humanoid_01/odom", self._odom_cb, 10
-        )
+        qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
+        self.create_subscription(Image, "/humanoid_01/image_raw", self._img_cb, qos)
+        self.create_subscription(Odometry, "/humanoid_01/odom", self._odom_cb, 10)
+        self.pub_cmd = self.create_publisher(Twist, "/humanoid_01/cmd_vel", 10)
+        self.pub_decision = self.create_publisher(String, "/humanoid_01/decision", 10)
+
         self.get_logger().info(
-            f"BrainLoopNode started. Goal: ({goal['x']:.1f}, {goal['y']:.1f})"
+            f"BrainLoopNode ready. cycle={cycle_sec}s two_stage={use_two_stage}"
         )
+
+    def _img_cb(self, msg: Image):
+        img = _imgmsg_to_bgr(msg)
+        with self._img_lock:
+            self._latest_img = img
+            self._img_stamp = time.monotonic()
 
     def _odom_cb(self, msg: Odometry):
         p = msg.pose.pose.position
-        self.current_pos = {"x": p.x, "y": p.y, "z": p.z}
+        self.odom_pos = {"x": p.x, "y": p.y, "z": p.z}
 
-    def distance_to_goal(self) -> float:
-        if self.current_pos is None:
-            return float("inf")
-        dx = self.goal["x"] - self.current_pos["x"]
-        dy = self.goal["y"] - self.current_pos["y"]
-        return math.sqrt(dx**2 + dy**2)
+    def get_latest_image(self) -> tuple[np.ndarray | None, float]:
+        with self._img_lock:
+            if self._latest_img is None:
+                return None, float("inf")
+            age_ms = (time.monotonic() - self._img_stamp) * 1000.0
+            return self._latest_img.copy(), age_ms
 
-    def step_loop(self):
-        """1ループ実行。到達していたらTrueを返す。"""
-        if self.current_pos is None:
-            self.get_logger().info("Waiting for odom...")
+    def publish_action(self, action: str, duration_sec: float):
+        twist = _make_twist(action)
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < duration_sec:
+            self.pub_cmd.publish(twist)
+            time.sleep(0.1)
+        self.pub_cmd.publish(Twist())
+
+    def log_cycle(self, img: np.ndarray, result: dict, light: dict | None = None):
+        cycle_dir = self.log_dir / f"cycle_{self.cycle:04d}"
+        cycle_dir.mkdir(parents=True, exist_ok=True)
+
+        cv2.imwrite(str(cycle_dir / "image.png"), img)
+
+        entry = {
+            "cycle": self.cycle,
+            "timestamp": datetime.utcnow().isoformat(),
+            "odom": self.odom_pos.copy(),
+            "image_age_ms": result.get("image_age_ms", 0),
+            "light_detect": light,
+            "claude": {
+                "latency_ms": result["latency_ms"],
+                "input_tokens": result.get("input_tokens", 0),
+                "output_tokens": result.get("output_tokens", 0),
+                "cost_usd": result["cost_usd"],
+            },
+            "decision": {
+                "observation": result.get("observation", ""),
+                "target_visible": result.get("target_visible", False),
+                "target_location": result.get("target_location", "none"),
+                "reasoning": result.get("reasoning", ""),
+                "action": result.get("action", "stay"),
+                "memory": result.get("memory", ""),
+            },
+        }
+        (cycle_dir / "decision.json").write_text(
+            json.dumps(entry, ensure_ascii=False, indent=2)
+        )
+        self.pub_decision.publish(String(data=json.dumps(entry, ensure_ascii=False)))
+
+    def step(self) -> bool:
+        img, age_ms = self.get_latest_image()
+        if img is None or age_ms > 6000:
+            self.get_logger().warn(f"No fresh image (age={age_ms:.0f}ms), waiting...")
+            self.pub_cmd.publish(Twist())
+            time.sleep(0.5)
             return False
 
-        dist = self.distance_to_goal()
-        if dist < GOAL_THRESHOLD:
-            self.get_logger().info(f"Goal reached! distance={dist:.3f}m")
-            self.pub.publish(Twist())
+        self.cycle += 1
+        state = {**self.odom_pos, "yaw": 0.0}
+
+        light = None
+        if self.use_two_stage and self.cycle % 10 != 0:
+            light = self.claude.light_detect(img)
+            self.total_cost += light["cost_usd"]
+            logger.info(
+                f"[{self.cycle}] light: visible={light['visible']} "
+                f"loc={light['location']} {light['latency_ms']:.0f}ms"
+            )
+            if not light["visible"]:
+                action = "left"
+                self.publish_action(action, self.cycle_sec)
+                return False
+
+        result = self.claude.decide(img, MISSION, state, self.memory[-3:])
+        result["image_age_ms"] = age_ms
+        self.total_cost += result["cost_usd"]
+
+        action = result.get("action", "stay")
+        logger.info(
+            f"[{self.cycle}] pos=({state['x']:.2f},{state['y']:.2f}) "
+            f"visible={result.get('target_visible')} action={action} "
+            f"{result['latency_ms']:.0f}ms ${result['cost_usd']:.4f}"
+        )
+        logger.info(f"  obs: {result.get('observation','')[:80]}")
+
+        self.memory.append(result.get("memory", ""))
+        self.log_cycle(img, result, light)
+
+        if action == "stay" and result.get("target_visible"):
+            self.get_logger().info("Goal reached! Stopping.")
+            self.pub_cmd.publish(Twist())
             self.reached = True
             return True
 
-        self.step += 1
-        self.get_logger().info(
-            f"[Step {self.step}] pos=({self.current_pos['x']:.3f},{self.current_pos['y']:.3f}) dist={dist:.3f}m"
-        )
-
-        # LLM判断
-        prompt = build_prompt(self.current_pos, self.goal, self.memory, self.step)
-        response = self.llm.generate(prompt)
-        decision = parse_llm_response(response)
-
-        action = decision.get("action", "stay")
-        reasoning = decision.get("reasoning", "")
-        new_memory = decision.get("memory", "")
-
-        # LLMが方向を逆に選んだ場合のジオメトリ補正
-        dx = self.goal["x"] - self.current_pos["x"]
-        dy = self.goal["y"] - self.current_pos["y"]
-        if action == "forward" and dy < -0.1:
-            logger.warning(f"LLM said 'forward' but dy={dy:.3f}<0 → overriding to 'backward'")
-            action = "backward"
-        elif action == "backward" and dy > 0.1:
-            logger.warning(f"LLM said 'backward' but dy={dy:.3f}>0 → overriding to 'forward'")
-            action = "forward"
-
-        print(f"  reasoning: {reasoning}")
-        print(f"  action: {action}")
-
-        # メモリ更新
-        self.memory = f"Step {self.step}: {new_memory or reasoning}"
-
-        # ログ保存
-        if self.log_path:
-            with jsonlines.open(self.log_path, mode='a') as writer:
-                writer.write({
-                    "step": self.step,
-                    "position": self.current_pos,
-                    "goal": self.goal,
-                    "distance": dist,
-                    "action": action,
-                    "reasoning": reasoning,
-                    "memory": self.memory,
-                })
-
-        dx, dy = ACTION_MAP.get(action, (0.0, 0.0))
-        twist = Twist()
-        twist.linear.x = dx * self.speed
-        twist.linear.y = dy * self.speed
-
-        # interval秒間 cmd_vel を送信
-        t0 = time.time()
-        while time.time() - t0 < self.interval:
-            self.pub.publish(twist)
-            rclpy.spin_once(self, timeout_sec=0.05)
-
-        # 次のステップまで停止
-        self.pub.publish(Twist())
+        self.publish_action(action, self.cycle_sec)
         return False
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--goal-x", type=float, default=DEFAULT_GOAL["x"])
-    parser.add_argument("--goal-y", type=float, default=DEFAULT_GOAL["y"])
-    parser.add_argument("--goal-z", type=float, default=DEFAULT_GOAL["z"])
-    parser.add_argument("--speed",    type=float, default=0.1)
-    parser.add_argument("--interval", type=float, default=2.0)
-    parser.add_argument("--timeout",  type=float, default=300.0)
-    parser.add_argument("--log",      type=str,
-                        default=os.path.expandvars("$SPD_RUNS/humanoid_brain.jsonl"))
+    parser.add_argument("--cycle", type=float,
+                        default=float(os.environ.get("SPD_BRAIN_CYCLE_SEC", "3")))
+    parser.add_argument("--timeout", type=float, default=300.0)
+    parser.add_argument("--two-stage", action="store_true",
+                        help="Enable light_detect → full decide two-stage loop")
+    parser.add_argument("--log-dir", type=str,
+                        default=os.path.expandvars(
+                            f"$SPD_RUNS/v0.4/{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}"))
     args, _ = parser.parse_known_args()
 
-    goal = {"x": args.goal_x, "y": args.goal_y, "z": args.goal_z,
-            "name": "Experiment_Rack"}
+    log_dir = Path(args.log_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
 
-    llm_host  = os.environ.get("SPD_LLM_HOST",  "http://localhost:11434")
-    llm_model = os.environ.get("SPD_LLM_MODEL", "qwen2.5:latest")
-    llm = OllamaClient(base_url=llm_host, model=llm_model, max_tokens=200)
-
-    os.makedirs(os.path.dirname(args.log), exist_ok=True)
+    model = os.environ.get("SPD_VLM_MODEL", "claude-sonnet-4-6")
+    claude = ClaudeVLMClient(model=model)
 
     rclpy.init()
     node = BrainLoopNode(
-        llm=llm, goal=goal, speed=args.speed,
-        interval=args.interval, log_path=args.log
+        claude=claude,
+        cycle_sec=args.cycle,
+        log_dir=log_dir,
+        use_two_stage=args.two_stage,
     )
 
-    t_start = time.time()
-    print(f"[brain_loop] Starting. Timeout={args.timeout}s, Goal=({goal['x']},{goal['y']})")
+    spin_thread = threading.Thread(target=rclpy.spin, args=(node,), daemon=True)
+    spin_thread.start()
 
+    print(f"[brain_loop] Start. cycle={args.cycle}s timeout={args.timeout}s "
+          f"two_stage={args.two_stage}")
+    print(f"[brain_loop] Log: {log_dir}")
+
+    t_start = time.monotonic()
     while rclpy.ok() and not node.reached:
-        if time.time() - t_start > args.timeout:
+        if time.monotonic() - t_start > args.timeout:
             print("[brain_loop] TIMEOUT.")
-            node.pub.publish(Twist())
+            node.pub_cmd.publish(Twist())
             break
-        rclpy.spin_once(node, timeout_sec=0.1)
-        node.step_loop()
+        node.step()
 
+    elapsed = time.monotonic() - t_start
+    print(f"[brain_loop] Done. cycles={node.cycle} "
+          f"elapsed={elapsed:.0f}s total_cost=${node.total_cost:.4f}")
     node.destroy_node()
     rclpy.shutdown()
-    print(f"[brain_loop] Finished after {node.step} steps.")
-    if args.log and os.path.exists(args.log):
-        print(f"[brain_loop] Log saved: {args.log}")
 
 
 if __name__ == "__main__":

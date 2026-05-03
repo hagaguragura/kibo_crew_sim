@@ -1,0 +1,213 @@
+"""Claude VLM client: describe() and decide() for humanoid brain."""
+
+import base64
+import time
+import os
+import numpy as np
+import anthropic
+import cv2
+
+
+# Pricing as of 2025-05 (USD per million tokens)
+_INPUT_PRICE_PER_M = 3.0    # claude-sonnet-4-6
+_OUTPUT_PRICE_PER_M = 15.0
+
+
+class ClaudeVLMClient:
+    def __init__(self, model: str = "claude-sonnet-4-6"):
+        self.model = model
+        self.client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+
+    def describe(self, image_bgr: np.ndarray, prompt: str,
+                 max_tokens: int = 256) -> dict:
+        """
+        Returns:
+            {"text": str, "latency_ms": float, "input_tokens": int,
+             "output_tokens": int, "cost_usd": float}
+        """
+        _, buf = cv2.imencode(".jpg", image_bgr)
+        b64 = base64.standard_b64encode(buf.tobytes()).decode("utf-8")
+
+        t0 = time.perf_counter()
+        response = self.client.messages.create(
+            model=self.model,
+            max_tokens=max_tokens,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image",
+                     "source": {"type": "base64", "media_type": "image/jpeg",
+                                "data": b64}},
+                    {"type": "text", "text": prompt},
+                ],
+            }],
+        )
+        latency_ms = (time.perf_counter() - t0) * 1000
+
+        in_tok = response.usage.input_tokens
+        out_tok = response.usage.output_tokens
+        cost = (in_tok * _INPUT_PRICE_PER_M + out_tok * _OUTPUT_PRICE_PER_M) / 1_000_000
+
+        return {
+            "text": response.content[0].text,
+            "latency_ms": round(latency_ms, 1),
+            "input_tokens": in_tok,
+            "output_tokens": out_tok,
+            "cost_usd": round(cost, 6),
+        }
+
+
+    def light_detect(self, image_bgr: np.ndarray) -> dict:
+        """Lightweight detection: is Int-Ball2 visible? Returns {visible, location, latency_ms, cost_usd}."""
+        small = cv2.resize(image_bgr, (320, 240))
+        _, buf = cv2.imencode(".jpg", small)
+        b64 = base64.standard_b64encode(buf.tobytes()).decode("utf-8")
+
+        prompt = (
+            'Is Int-Ball2 (a small white spherical robot, ~30cm diameter) visible in this image? '
+            'Reply STRICTLY in JSON: {"visible": true|false, "location": "left"|"center"|"right"|"none"}'
+        )
+
+        t0 = time.perf_counter()
+        response = self.client.messages.create(
+            model=self.model,
+            max_tokens=30,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image",
+                     "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
+                    {"type": "text", "text": prompt},
+                ],
+            }],
+        )
+        latency_ms = (time.perf_counter() - t0) * 1000
+
+        in_tok = response.usage.input_tokens
+        out_tok = response.usage.output_tokens
+        cost = (in_tok * _INPUT_PRICE_PER_M + out_tok * _OUTPUT_PRICE_PER_M) / 1_000_000
+
+        raw = response.content[0].text
+        try:
+            import json as _json
+            start = raw.find('{')
+            end = raw.rfind('}')
+            parsed = _json.loads(raw[start:end+1])
+        except Exception:
+            parsed = {"visible": False, "location": "none"}
+
+        return {
+            "visible": parsed.get("visible", False),
+            "location": parsed.get("location", "none"),
+            "latency_ms": round(latency_ms, 1),
+            "cost_usd": round(cost, 6),
+        }
+
+    def decide(self, image_bgr: np.ndarray, mission: str, state: dict,
+               memory: list, max_tokens: int = 400) -> dict:
+        """Unified brain call: image + mission + state + memory -> action JSON."""
+        _, buf = cv2.imencode(".jpg", image_bgr)
+        b64 = base64.standard_b64encode(buf.tobytes()).decode("utf-8")
+
+        memory_lines = "\n".join(f"- {m}" for m in memory) if memory else "None"
+        prompt = f"""You are humanoid_01, an astronaut inside the JEM "Kibo" module of the ISS.
+
+Mission:
+{mission}
+
+Current state:
+- Position: x={state.get('x', 0):.2f}, y={state.get('y', 0):.2f}, z={state.get('z', 0):.2f}
+- Heading: {state.get('yaw', 0):.1f} deg
+
+Recent memory (last cycles):
+{memory_lines}
+
+The attached image is the current view from your eyes.
+
+Decide your single next action. Reply ONLY with this JSON object, no prose:
+{{
+  "observation": "what you see relevant to the mission (1-2 sentences)",
+  "target_visible": true | false,
+  "target_location": "left" | "right" | "center" | "none",
+  "reasoning": "why this action (1-2 sentences)",
+  "action": "forward" | "backward" | "left" | "right" | "stay",
+  "memory": "one short sentence to remember next cycle"
+}}
+
+Action semantics:
+- forward / backward: move along current heading (+X direction)
+- left / right: rotate in place (~30 degrees)
+- stay: stop (use when goal is reached or unsure)"""
+
+        t0 = time.perf_counter()
+        response = self.client.messages.create(
+            model=self.model,
+            max_tokens=max_tokens,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image",
+                     "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
+                    {"type": "text", "text": prompt},
+                ],
+            }],
+        )
+        latency_ms = (time.perf_counter() - t0) * 1000
+
+        in_tok = response.usage.input_tokens
+        out_tok = response.usage.output_tokens
+        cost = (in_tok * _INPUT_PRICE_PER_M + out_tok * _OUTPUT_PRICE_PER_M) / 1_000_000
+
+        raw = response.content[0].text
+        try:
+            import json as _json
+            start = raw.find('{')
+            end = raw.rfind('}')
+            decision = _json.loads(raw[start:end+1])
+        except Exception:
+            decision = {"observation": "", "target_visible": False,
+                        "target_location": "none", "reasoning": "parse error",
+                        "action": "stay", "memory": "parse error"}
+
+        return {
+            **decision,
+            "latency_ms": round(latency_ms, 1),
+            "cost_usd": round(cost, 6),
+            "input_tokens": in_tok,
+            "output_tokens": out_tok,
+            "raw": raw,
+        }
+
+
+if __name__ == "__main__":
+    import argparse, json, sys
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(__file__), "../../../.env"))
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--image", required=True)
+    parser.add_argument("--prompt", default="Describe what you see in 1 sentence.")
+    parser.add_argument("--model", default="claude-sonnet-4-6")
+    parser.add_argument("--decide", action="store_true")
+    parser.add_argument("--light", action="store_true")
+    parser.add_argument("--mission", default="Find Int-Ball2 and approach within 1 meter.")
+    parser.add_argument("--state", default='{"x":0,"y":0,"z":0.8,"yaw":0}')
+    parser.add_argument("--memory", default='[]')
+    args = parser.parse_args()
+
+    img = cv2.imread(args.image)
+    if img is None:
+        print(f"ERROR: cannot read {args.image}", file=sys.stderr)
+        sys.exit(1)
+
+    client = ClaudeVLMClient(model=args.model)
+
+    if args.decide:
+        result = client.decide(img, args.mission,
+                               json.loads(args.state), json.loads(args.memory))
+    elif args.light:
+        result = client.light_detect(img)
+    else:
+        result = client.describe(img, args.prompt)
+
+    print(json.dumps(result, ensure_ascii=False, indent=2))
