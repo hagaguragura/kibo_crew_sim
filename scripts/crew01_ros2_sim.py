@@ -95,7 +95,7 @@ def build_crew01(stage):
     cam.GetHorizontalApertureAttr().Set(20.955)
     cam.GetFocalLengthAttr().Set(18.147)
     cam.GetClippingRangeAttr().Set(Gf.Vec2f(0.05, 50.0))
-    UsdGeom.Xformable(cam.GetPrim()).AddRotateXOp().Set(-90.0)
+    UsdGeom.Xformable(cam.GetPrim()).AddRotateXOp().Set(90.0)
 
     UsdPhysics.RigidBodyAPI.Apply(crew.GetPrim()).CreateKinematicEnabledAttr(True)
     return crew
@@ -182,9 +182,12 @@ def main():
     stage = omni.usd.get_context().get_stage()
     stage.Load("/World/KIBOU")
 
-    # シーン照明補完
-    dome = UsdLux.DomeLight.Define(stage, "/World/CaptureDomeLight")
-    dome.GetIntensityAttr().Set(300)
+    # KIBOU内部照明（DomeLightは外壁を貫通しないのでSphereLight追加）
+    for i, pos in enumerate([(20.5, 0.0, 2.5), (20.5, 0.0, 0.5)]):
+        sl = UsdLux.SphereLight.Define(stage, f"/World/KibouInteriorLight_{i}")
+        sl.GetIntensityAttr().Set(5000)
+        sl.GetRadiusAttr().Set(0.1)
+        UsdGeom.Xformable(sl.GetPrim()).AddTranslateOp().Set(Gf.Vec3d(*pos))
 
     build_crew01(stage)
     simulation_app.update()
