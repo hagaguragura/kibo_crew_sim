@@ -35,6 +35,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../src/vlm_bench"))
 from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(__file__), "../.env"))
 from clients.claude_client import ClaudeVLMClient
+from brain.image_buffer import imgmsg_to_bgr
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -57,12 +58,6 @@ def _make_twist(action: str) -> Twist:
     return t
 
 
-def _imgmsg_to_bgr(msg: Image) -> np.ndarray:
-    img = np.frombuffer(msg.data, dtype=np.uint8).reshape((msg.height, msg.width, -1))
-    if msg.encoding in ("rgb8", "rgb"):
-        img = img[:, :, ::-1].copy()
-    return img
-
 
 class BrainLoopNode(Node):
     def __init__(self, claude: ClaudeVLMClient, cycle_sec: float,
@@ -77,13 +72,13 @@ class BrainLoopNode(Node):
         self._latest_img: np.ndarray | None = None
         self._img_stamp: float = 0.0
 
-        self.odom_pos = {"x": 0.0, "y": 0.0, "z": 0.0}
+        self.odom_pos = {"x": 0.0, "y": 0.0, "z": 0.0, "yaw": 0.0}
         self.memory: list[str] = []
         self.cycle = 0
         self.reached = False
         self.total_cost = 0.0
 
-        qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
+        qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
         self.create_subscription(Image, "/humanoid_01/image_raw", self._img_cb, qos)
         self.create_subscription(Odometry, "/humanoid_01/odom", self._odom_cb, 10)
         self.pub_cmd = self.create_publisher(Twist, "/humanoid_01/cmd_vel", 10)
@@ -94,14 +89,18 @@ class BrainLoopNode(Node):
         )
 
     def _img_cb(self, msg: Image):
-        img = _imgmsg_to_bgr(msg)
+        img = imgmsg_to_bgr(msg)
         with self._img_lock:
             self._latest_img = img
             self._img_stamp = time.monotonic()
 
     def _odom_cb(self, msg: Odometry):
         p = msg.pose.pose.position
-        self.odom_pos = {"x": p.x, "y": p.y, "z": p.z}
+        q = msg.pose.pose.orientation
+        # yaw from quaternion (rotation around Z only)
+        yaw_rad = 2.0 * math.atan2(q.z, q.w)
+        yaw_deg = math.degrees(yaw_rad)
+        self.odom_pos = {"x": p.x, "y": p.y, "z": p.z, "yaw": yaw_deg}
 
     def get_latest_image(self) -> tuple[np.ndarray | None, float]:
         with self._img_lock:
@@ -159,7 +158,7 @@ class BrainLoopNode(Node):
             return False
 
         self.cycle += 1
-        state = {**self.odom_pos, "yaw": 0.0}
+        state = {**self.odom_pos}
 
         light = None
         if self.use_two_stage and self.cycle % 10 != 0:

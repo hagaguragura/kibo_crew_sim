@@ -12,10 +12,18 @@
 import sys
 import os
 import time
+import math
+import argparse
 import numpy as np
 
+sys.path.insert(0, os.path.dirname(__file__))
+
+_parser = argparse.ArgumentParser()
+_parser.add_argument("--headless", action="store_true", default=False)
+_args, _ = _parser.parse_known_args()
+
 from isaacsim import SimulationApp
-simulation_app = SimulationApp({"headless": True, "renderer": "RaytracedLighting"})
+simulation_app = SimulationApp({"headless": _args.headless, "renderer": "RaytracedLighting"})
 
 from isaacsim.core.utils.extensions import enable_extension
 enable_extension("isaacsim.ros2.bridge")
@@ -26,6 +34,7 @@ import omni.timeline
 import omni.graph.core as og
 import omni.replicator.core as rep
 from isaacsim.core.utils.stage import open_stage
+from spawn_intball import spawn_intball
 from pxr import Usd, UsdGeom, UsdLux, Gf
 
 import rclpy
@@ -37,14 +46,15 @@ KIBOU_USD = os.path.expandvars(
     "$SPD_WS/src/int-ball2_isaac_sim/int-ball2_isaac_sim/assets/KIBOU_with_humanoid.usd"
 )
 HUMANOID_PATH = "/World/Humanoid_01"
-INITIAL_POS = np.array([20.5, 0.5, 0.8])
+INTBALL2_PATH = "/World/IntBall2"
+INITIAL_POS = np.array([20.5, 0.0, 0.3])
 
 CAM_PATH = f"{HUMANOID_PATH}/HeadMount/Camera_01"
 CAM_RES  = (640, 480)
 
 X_MIN, X_MAX = 19.0, 22.0
 Y_MIN, Y_MAX = -1.0, 5.0
-Z = 0.8
+Z = 0.3
 
 
 class HumanoidSimNode(Node):
@@ -52,6 +62,8 @@ class HumanoidSimNode(Node):
         super().__init__("humanoid_sim")
         self.position = INITIAL_POS.copy()
         self.cmd_vel = np.zeros(3)
+        self.angular_z = 0.0
+        self.yaw = 0.0  # radians
         self.dt = 1.0 / 10.0  # 10Hz に合わせる
 
         self.pub_odom = self.create_publisher(Odometry, "/humanoid_01/odom", 10)
@@ -62,33 +74,42 @@ class HumanoidSimNode(Node):
 
     def _cmd_vel_cb(self, msg: Twist):
         self.cmd_vel = np.array([msg.linear.x, msg.linear.y, msg.linear.z])
+        self.angular_z = msg.angular.z
         self.get_logger().info(
-            f"cmd_vel received: x={msg.linear.x:.2f} y={msg.linear.y:.2f}"
+            f"cmd_vel received: x={msg.linear.x:.2f} y={msg.linear.y:.2f} "
+            f"yaw_rate={msg.angular.z:.2f}"
         )
 
-    def update(self, translate_op):
-        # 位置更新
-        delta = self.cmd_vel * self.dt
-        new_pos = self.position + delta
+    def update(self, translate_op, rotate_op):
+        # 差動駆動: yaw 更新 → heading に沿って前進
+        self.yaw += self.angular_z * self.dt
+        linear_x = float(self.cmd_vel[0])
+        dx = math.cos(self.yaw) * linear_x * self.dt
+        dy = math.sin(self.yaw) * linear_x * self.dt
+        new_pos = self.position + np.array([dx, dy, 0.0])
         new_pos[0] = float(np.clip(new_pos[0], X_MIN, X_MAX))
         new_pos[1] = float(np.clip(new_pos[1], Y_MIN, Y_MAX))
         new_pos[2] = Z
         self.position = new_pos
 
-        # USD更新
+        # USD更新: 位置 + 回転（カメラの向きに反映）
         if translate_op:
             translate_op.Set(Gf.Vec3d(*self.position))
+        if rotate_op:
+            rotate_op.Set(math.degrees(self.yaw))
 
-        # odom publish
+        # odom publish (yaw → quaternion: qw=cos(yaw/2), qz=sin(yaw/2))
+        half = self.yaw / 2.0
         msg = Odometry()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = "world"
         msg.pose.pose.position.x = float(self.position[0])
         msg.pose.pose.position.y = float(self.position[1])
         msg.pose.pose.position.z = float(self.position[2])
-        msg.pose.pose.orientation.w = 1.0
-        msg.twist.twist.linear.x = float(self.cmd_vel[0])
-        msg.twist.twist.linear.y = float(self.cmd_vel[1])
+        msg.pose.pose.orientation.w = math.cos(half)
+        msg.pose.pose.orientation.z = math.sin(half)
+        msg.twist.twist.linear.x = linear_x
+        msg.twist.twist.angular.z = self.angular_z
         self.pub_odom.publish(msg)
 
 
@@ -103,11 +124,28 @@ def get_translate_op(stage, prim_path):
     return xformable.AddTranslateOp()
 
 
+def get_rotate_z_op(stage, prim_path):
+    prim = stage.GetPrimAtPath(prim_path)
+    if not prim.IsValid():
+        return None
+    xformable = UsdGeom.Xformable(prim)
+    for op in xformable.GetOrderedXformOps():
+        if "rotateZ" in op.GetOpName():
+            return op
+    return xformable.AddRotateZOp()
+
+
 def setup_camera(stage):
-    for i, pos in enumerate([(20.5, 0.0, 2.5), (20.5, 0.0, 0.5)]):
+    # KIBOU interior: 6灯で全域をカバー
+    light_positions = [
+        (20.5, 0.0, 2.5), (20.5, 0.0, 0.5),  # 初期位置付近
+        (20.5, 2.0, 2.0), (20.5, 4.0, 2.0),   # Y+ 方向
+        (21.5, 1.0, 2.0), (19.5, 1.0, 2.0),   # X方向両端
+    ]
+    for i, pos in enumerate(light_positions):
         sl = UsdLux.SphereLight.Define(stage, f"/World/KibouInteriorLight_{i}")
-        sl.GetIntensityAttr().Set(5000)
-        sl.GetRadiusAttr().Set(0.1)
+        sl.GetIntensityAttr().Set(8000)
+        sl.GetRadiusAttr().Set(0.2)
         UsdGeom.Xformable(sl.GetPrim()).AddTranslateOp().Set(Gf.Vec3d(*pos))
 
     head_mount = UsdGeom.Xform.Define(stage, f"{HUMANOID_PATH}/HeadMount")
@@ -117,7 +155,7 @@ def setup_camera(stage):
     cam.GetHorizontalApertureAttr().Set(20.955)
     cam.GetFocalLengthAttr().Set(18.147)
     cam.GetClippingRangeAttr().Set(Gf.Vec2f(0.05, 50.0))
-    UsdGeom.Xformable(cam.GetPrim()).AddRotateXOp().Set(90.0)
+    UsdGeom.Xformable(cam.GetPrim()).AddRotateXOp().Set(105.0)
 
     simulation_app.update()
 
@@ -148,6 +186,21 @@ def setup_camera(stage):
     print(f"[camera] /humanoid_01/image_raw ready ({CAM_RES[0]}x{CAM_RES[1]})")
 
 
+def freeze_intball(stage):
+    """Intball2.usd 内の RigidBody を kinematic に設定して位置固定する。
+    spawn_intball() 後に simulation_app.update() でリファレンスを解決してから呼ぶこと。
+    """
+    from pxr import UsdPhysics, Usd
+    root = stage.GetPrimAtPath(INTBALL2_PATH)
+    if not root.IsValid():
+        print("[freeze_intball] /World/IntBall2 not found, skipping.")
+        return
+    for prim in Usd.PrimRange(root):
+        if prim.HasAPI(UsdPhysics.RigidBodyAPI):
+            UsdPhysics.RigidBodyAPI(prim).CreateKinematicEnabledAttr(True)
+            print(f"[freeze_intball] kinematic=True: {prim.GetPath()}")
+
+
 def main():
     if not os.path.exists(KIBOU_USD):
         print(f"ERROR: {KIBOU_USD} not found.")
@@ -158,9 +211,13 @@ def main():
     simulation_app.update()
 
     stage = omni.usd.get_context().get_stage()
+    spawn_intball(stage)
+    simulation_app.update()   # リファレンス解決を待つ
+    freeze_intball(stage)     # 子prim の RigidBody を kinematic に固定
     setup_camera(stage)
     timeline = omni.timeline.get_timeline_interface()
     translate_op = get_translate_op(stage, HUMANOID_PATH)
+    rotate_op = get_rotate_z_op(stage, HUMANOID_PATH)
 
     rclpy.init()
     node = HumanoidSimNode()
@@ -172,7 +229,7 @@ def main():
             # cmd_vel を受信するために十分待つ
             rclpy.spin_once(node, timeout_sec=0.05)
             # 位置更新 + odom publish
-            node.update(translate_op)
+            node.update(translate_op, rotate_op)
             # Isaac Sim 描画
             simulation_app.update()
     except KeyboardInterrupt:

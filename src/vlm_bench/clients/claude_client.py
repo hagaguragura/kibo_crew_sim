@@ -1,6 +1,7 @@
 """Claude VLM client: describe() and decide() for humanoid brain."""
 
 import base64
+import json
 import time
 import os
 import numpy as np
@@ -11,6 +12,19 @@ import cv2
 # Pricing as of 2025-05 (USD per million tokens)
 _INPUT_PRICE_PER_M = 3.0    # claude-sonnet-4-6
 _OUTPUT_PRICE_PER_M = 15.0
+
+
+def _calc_cost(in_tok: int, out_tok: int) -> float:
+    return round((in_tok * _INPUT_PRICE_PER_M + out_tok * _OUTPUT_PRICE_PER_M) / 1_000_000, 6)
+
+
+def _parse_json(raw: str) -> dict | None:
+    try:
+        start = raw.find('{')
+        end = raw.rfind('}')
+        return json.loads(raw[start:end + 1])
+    except Exception:
+        return None
 
 
 class ClaudeVLMClient:
@@ -46,14 +60,13 @@ class ClaudeVLMClient:
 
         in_tok = response.usage.input_tokens
         out_tok = response.usage.output_tokens
-        cost = (in_tok * _INPUT_PRICE_PER_M + out_tok * _OUTPUT_PRICE_PER_M) / 1_000_000
 
         return {
             "text": response.content[0].text,
             "latency_ms": round(latency_ms, 1),
             "input_tokens": in_tok,
             "output_tokens": out_tok,
-            "cost_usd": round(cost, 6),
+            "cost_usd": _calc_cost(in_tok, out_tok),
         }
 
 
@@ -85,22 +98,15 @@ class ClaudeVLMClient:
 
         in_tok = response.usage.input_tokens
         out_tok = response.usage.output_tokens
-        cost = (in_tok * _INPUT_PRICE_PER_M + out_tok * _OUTPUT_PRICE_PER_M) / 1_000_000
 
         raw = response.content[0].text
-        try:
-            import json as _json
-            start = raw.find('{')
-            end = raw.rfind('}')
-            parsed = _json.loads(raw[start:end+1])
-        except Exception:
-            parsed = {"visible": False, "location": "none"}
+        parsed = _parse_json(raw) or {"visible": False, "location": "none"}
 
         return {
             "visible": parsed.get("visible", False),
             "location": parsed.get("location", "none"),
             "latency_ms": round(latency_ms, 1),
-            "cost_usd": round(cost, 6),
+            "cost_usd": _calc_cost(in_tok, out_tok),
         }
 
     def decide(self, image_bgr: np.ndarray, mission: str, state: dict,
@@ -137,7 +143,12 @@ Decide your single next action. Reply ONLY with this JSON object, no prose:
 Action semantics:
 - forward / backward: move along current heading (+X direction)
 - left / right: rotate in place (~30 degrees)
-- stay: stop (use when goal is reached or unsure)"""
+- stay: stop (use when goal is reached or unsure)
+
+Decision rules (follow strictly):
+1. If target_visible=true → choose "forward" to approach. Do NOT rotate.
+2. If target_visible=false → choose "left" or "right" to scan.
+3. Choose "stay" ONLY when you have physically moved to within 1 meter of the target."""
 
         t0 = time.perf_counter()
         response = self.client.messages.create(
@@ -156,23 +167,18 @@ Action semantics:
 
         in_tok = response.usage.input_tokens
         out_tok = response.usage.output_tokens
-        cost = (in_tok * _INPUT_PRICE_PER_M + out_tok * _OUTPUT_PRICE_PER_M) / 1_000_000
 
         raw = response.content[0].text
-        try:
-            import json as _json
-            start = raw.find('{')
-            end = raw.rfind('}')
-            decision = _json.loads(raw[start:end+1])
-        except Exception:
-            decision = {"observation": "", "target_visible": False,
-                        "target_location": "none", "reasoning": "parse error",
-                        "action": "stay", "memory": "parse error"}
+        decision = _parse_json(raw) or {
+            "observation": "", "target_visible": False,
+            "target_location": "none", "reasoning": "parse error",
+            "action": "stay", "memory": "parse error",
+        }
 
         return {
             **decision,
             "latency_ms": round(latency_ms, 1),
-            "cost_usd": round(cost, 6),
+            "cost_usd": _calc_cost(in_tok, out_tok),
             "input_tokens": in_tok,
             "output_tokens": out_tok,
             "raw": raw,

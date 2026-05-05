@@ -11,7 +11,8 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Image
 
 
-def _imgmsg_to_bgr(msg: Image) -> np.ndarray:
+def imgmsg_to_bgr(msg: Image) -> np.ndarray:
+    """ROS2 Image メッセージを BGR numpy 配列に変換する。"""
     img = np.frombuffer(msg.data, dtype=np.uint8).reshape((msg.height, msg.width, -1))
     if msg.encoding in ("rgb8", "rgb"):
         img = img[:, :, ::-1].copy()
@@ -27,12 +28,12 @@ class ImageBuffer(Node):
         self._image: Optional[np.ndarray] = None
         self._stamp: float = 0.0
 
-        qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
+        qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
         self.create_subscription(Image, "/humanoid_01/image_raw", self._cb, qos)
         self.get_logger().info("ImageBuffer: waiting for /humanoid_01/image_raw ...")
 
     def _cb(self, msg: Image):
-        img = _imgmsg_to_bgr(msg)
+        img = imgmsg_to_bgr(msg)
         with self._lock:
             self._image = img
             self._stamp = time.monotonic()
