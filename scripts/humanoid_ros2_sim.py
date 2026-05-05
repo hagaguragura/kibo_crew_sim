@@ -58,7 +58,9 @@ class HumanoidSimNode(Node):
     def __init__(self):
         super().__init__("humanoid_sim")
         self.position = INITIAL_POS.copy()
-        self.linear_y = 0.0  # +Y 方向の速度のみ使用
+        self.linear_y = 0.0
+        self.angular_z = 0.0
+        self.yaw = 0.0  # ラジアン、初期は +Y 方向
         self.dt = 1.0 / 10.0
 
         self.pub_odom = self.create_publisher(Odometry, "/humanoid_01/odom", 10)
@@ -69,12 +71,15 @@ class HumanoidSimNode(Node):
 
     def _cmd_vel_cb(self, msg: Twist):
         self.linear_y = msg.linear.y
-        self.get_logger().info(f"cmd_vel received: y={msg.linear.y:.2f}")
+        self.angular_z = msg.angular.z
+        self.get_logger().info(f"cmd_vel received: y={msg.linear.y:.2f} az={msg.angular.z:.2f}")
 
-    def update(self, translate_op):
-        # +Y 方向のみの単純移動（回転なし）
-        dy = self.linear_y * self.dt
-        new_pos = self.position + np.array([0.0, dy, 0.0])
+    def update(self, translate_op, rotate_op):
+        self.yaw = np.fmod(self.yaw + self.angular_z * self.dt, 2 * np.pi)
+
+        dx = -np.sin(self.yaw) * self.linear_y * self.dt
+        dy = np.cos(self.yaw) * self.linear_y * self.dt
+        new_pos = self.position + np.array([dx, dy, 0.0])
         new_pos[0] = float(np.clip(new_pos[0], X_MIN, X_MAX))
         new_pos[1] = float(np.clip(new_pos[1], Y_MIN, Y_MAX))
         new_pos[2] = Z
@@ -82,15 +87,20 @@ class HumanoidSimNode(Node):
 
         if translate_op:
             translate_op.Set(Gf.Vec3d(*self.position))
+        if rotate_op:
+            rotate_op.Set(float(np.degrees(self.yaw)))
 
+        yaw_half = self.yaw / 2.0
         msg = Odometry()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = "world"
         msg.pose.pose.position.x = float(self.position[0])
         msg.pose.pose.position.y = float(self.position[1])
         msg.pose.pose.position.z = float(self.position[2])
-        msg.pose.pose.orientation.w = 1.0  # 回転なし
+        msg.pose.pose.orientation.z = float(np.sin(yaw_half))
+        msg.pose.pose.orientation.w = float(np.cos(yaw_half))
         msg.twist.twist.linear.y = self.linear_y
+        msg.twist.twist.angular.z = self.angular_z
         self.pub_odom.publish(msg)
 
 
@@ -103,6 +113,17 @@ def get_translate_op(stage, prim_path):
         if "translate" in op.GetOpName():
             return op
     return xformable.AddTranslateOp()
+
+
+def get_rotate_z_op(stage, prim_path):
+    prim = stage.GetPrimAtPath(prim_path)
+    if not prim.IsValid():
+        return None
+    xformable = UsdGeom.Xformable(prim)
+    for op in xformable.GetOrderedXformOps():
+        if "rotateZ" in op.GetOpName():
+            return op
+    return xformable.AddRotateZOp()
 
 
 
@@ -126,7 +147,7 @@ def setup_camera(stage):
     cam.GetHorizontalApertureAttr().Set(20.955)
     cam.GetFocalLengthAttr().Set(18.147)
     cam.GetClippingRangeAttr().Set(Gf.Vec2f(0.05, 50.0))
-    UsdGeom.Xformable(cam.GetPrim()).AddRotateXOp().Set(105.0)
+    UsdGeom.Xformable(cam.GetPrim()).AddRotateXOp().Set(90.0)
 
     simulation_app.update()
 
@@ -171,6 +192,7 @@ def main():
     setup_camera(stage)
     timeline = omni.timeline.get_timeline_interface()
     translate_op = get_translate_op(stage, HUMANOID_PATH)
+    rotate_op = get_rotate_z_op(stage, HUMANOID_PATH)
 
     rclpy.init()
     node = HumanoidSimNode()
@@ -180,7 +202,7 @@ def main():
     try:
         while simulation_app.is_running():
             rclpy.spin_once(node, timeout_sec=0.05)
-            node.update(translate_op)
+            node.update(translate_op, rotate_op)
             simulation_app.update()
     except KeyboardInterrupt:
         pass

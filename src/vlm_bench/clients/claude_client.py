@@ -110,49 +110,82 @@ class ClaudeVLMClient:
         }
 
     def decide(self, image_bgr: np.ndarray, mission: str, state: dict,
-               memory: list, max_tokens: int = 400) -> dict:
-        """Unified brain call: image + mission + state + memory -> action JSON."""
+               sensors_now: dict | None = None,
+               sensors_history: list[dict] | None = None,
+               memory: list | None = None,
+               max_tokens: int = 500) -> dict:
+        """v0.5: image + mission + state + sensors + memory -> action JSON."""
         _, buf = cv2.imencode(".jpg", image_bgr)
         b64 = base64.standard_b64encode(buf.tobytes()).decode("utf-8")
 
+        memory = memory or []
+        sensors_now = sensors_now or {}
+        sensors_history = sensors_history or []
+
         memory_lines = "\n".join(f"- {m}" for m in memory) if memory else "None"
+
+        if sensors_now:
+            o2 = sensors_now.get("o2_percent", 21.0)
+            p = sensors_now.get("pressure_kpa", 101.3)
+            t = sensors_now.get("temperature_c", 22.0)
+            alarm = sensors_now.get("alarm", False)
+            sensors_block = f"""
+[Environment sensors — current]
+- O2: {o2:.1f}%      (baseline 21.0%)
+- Pressure: {p:.1f} kPa  (baseline 101.3 kPa)
+- Temperature: {t:.1f}°C
+- Alarm: {alarm}"""
+            if sensors_history:
+                hist_lines = "  ".join(
+                    f"T-{(len(sensors_history)-i)*5}s: O2={e.get('o2_percent', 21.0):.1f}"
+                    for i, e in enumerate(sensors_history[-6:])
+                )
+                sensors_block += f"\n\n[Environment sensors — history]\n{hist_lines}"
+        else:
+            sensors_block = "\n[Environment sensors]\nNot yet connected."
+
         prompt = f"""You are humanoid_01, an astronaut inside the JEM "Kibo" module of the ISS.
 
 Mission:
 {mission}
 
 Current state:
-- Position: x={state.get('x', 0):.2f}, y={state.get('y', 0):.2f}, z={state.get('z', 0):.2f}
+- Position: x={state.get('x', 0):.2f}, y={state.get('y', 0):.2f}
+- Heading: {state.get('yaw_deg', 0):.0f}° (0°=+Y forward, 90°=-X left)
+{sensors_block}
 
 Recent memory (last cycles):
 {memory_lines}
 
-The attached image is the current view from your eyes.
+The attached image is your current first-person view.
 
-Decide your single next action. Reply ONLY with this JSON object, no prose:
+Decide your single next action. Reply ONLY with this JSON, no prose:
 {{
-  "observation": "what you see relevant to the mission (1-2 sentences)",
-  "target_visible": true | false,
-  "target_location": "left" | "right" | "center" | "none",
-  "reasoning": "why this action (1-2 sentences)",
-  "action": "forward" | "backward" | "stay",
+  "observation": "what you see in 1-2 sentences",
+  "interpretation": "what the sensor readings mean for your situation",
+  "reasoning": "why this action in 1-2 sentences",
+  "concern_level": "calm" | "alert" | "concerned" | "alarmed",
+  "action": "move_forward" | "move_backward" | "turn_left" | "turn_right" | "inspect" | "communicate" | "report_status",
+  "communicate_text": "message to ground (only if action=communicate, else empty string)",
   "memory": "one short sentence to remember next cycle"
 }}
 
 Action semantics:
-- forward: move toward Int-Ball2 (+Y direction)
-- backward: move away from Int-Ball2 (-Y direction)
-- stay: stop (use when within 1 meter of target)
+- move_forward: move in current heading direction
+- move_backward: move opposite to heading
+- turn_left: rotate left (~0.5 rad/s)
+- turn_right: rotate right
+- inspect: stay still and observe carefully
+- communicate: send a message to ground control (fill communicate_text)
+- report_status: internal status log (no movement)
 
-Decision rules (follow strictly):
-1. If target_visible=true AND far → choose "forward" to approach.
-2. If target_visible=true AND close (within 1m) → choose "stay".
-3. If target_visible=false → choose "forward" (target is ahead, keep moving)."""
+Exploration guidance: vary your actions — combine turning and moving to explore different directions."""
 
         t0 = time.perf_counter()
         response = self.client.messages.create(
             model=self.model,
             max_tokens=max_tokens,
+            temperature=0.4,
             messages=[{
                 "role": "user",
                 "content": [
@@ -169,9 +202,9 @@ Decision rules (follow strictly):
 
         raw = response.content[0].text
         decision = _parse_json(raw) or {
-            "observation": "", "target_visible": False,
-            "target_location": "none", "reasoning": "parse error",
-            "action": "stay", "memory": "parse error",
+            "observation": "", "interpretation": "parse error",
+            "reasoning": "parse error", "concern_level": "calm",
+            "action": "inspect", "communicate_text": "", "memory": "parse error",
         }
 
         return {
