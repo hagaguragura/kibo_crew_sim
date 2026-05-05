@@ -234,8 +234,11 @@ def main():
     elapsed = time.monotonic() - t_start
     print(f"[brain_loop] Done. cycles={node.cycle} "
           f"elapsed={elapsed:.0f}s total_cost=${node.total_cost:.4f}")
-    node.destroy_node()
-    rclpy.shutdown()
+    try:
+        node.destroy_node()
+        rclpy.shutdown()
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":

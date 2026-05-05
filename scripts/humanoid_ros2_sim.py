@@ -164,7 +164,8 @@ def main():
         sys.exit(1)
 
     open_stage(KIBOU_USD)
-    simulation_app.update()
+    for _ in range(5):  # レンダラー初期化が完了するまで数フレーム待つ
+        simulation_app.update()
 
     stage = omni.usd.get_context().get_stage()
     setup_camera(stage)
