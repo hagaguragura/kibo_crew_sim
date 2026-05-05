@@ -55,6 +55,8 @@ Z = 0.3
 
 
 class HumanoidSimNode(Node):
+    CMD_VEL_TIMEOUT = 0.5  # cmd_vel が来なくなったら0.5秒で自動停止
+
     def __init__(self):
         super().__init__("humanoid_sim")
         self.position = INITIAL_POS.copy()
@@ -62,6 +64,8 @@ class HumanoidSimNode(Node):
         self.angular_z = 0.0
         self.yaw = 0.0  # ラジアン、初期は +Y 方向
         self.dt = 1.0 / 10.0
+        self._last_cmd_time = 0.0
+        self._last_update_time = time.monotonic()
 
         self.pub_odom = self.create_publisher(Odometry, "/humanoid_01/odom", 10)
         self.sub_cmd = self.create_subscription(
@@ -72,13 +76,22 @@ class HumanoidSimNode(Node):
     def _cmd_vel_cb(self, msg: Twist):
         self.linear_y = msg.linear.y
         self.angular_z = msg.angular.z
+        self._last_cmd_time = time.monotonic()
         self.get_logger().info(f"cmd_vel received: y={msg.linear.y:.2f} az={msg.angular.z:.2f}")
 
     def update(self, translate_op, rotate_op):
-        self.yaw = np.fmod(self.yaw + self.angular_z * self.dt, 2 * np.pi)
+        now = time.monotonic()
+        dt = min(now - self._last_update_time, 0.2)  # 最大200msでキャップ
+        self._last_update_time = now
 
-        dx = -np.sin(self.yaw) * self.linear_y * self.dt
-        dy = np.cos(self.yaw) * self.linear_y * self.dt
+        if self._last_cmd_time > 0 and now - self._last_cmd_time > self.CMD_VEL_TIMEOUT:
+            self.linear_y = 0.0
+            self.angular_z = 0.0
+
+        self.yaw = np.fmod(self.yaw + self.angular_z * dt, 2 * np.pi)
+
+        dx = -np.sin(self.yaw) * self.linear_y * dt
+        dy = np.cos(self.yaw) * self.linear_y * dt
         new_pos = self.position + np.array([dx, dy, 0.0])
         new_pos[0] = float(np.clip(new_pos[0], X_MIN, X_MAX))
         new_pos[1] = float(np.clip(new_pos[1], Y_MIN, Y_MAX))
@@ -185,18 +198,22 @@ def main():
         sys.exit(1)
 
     open_stage(KIBOU_USD)
-    for _ in range(5):  # レンダラー初期化が完了するまで数フレーム待つ
+    for _ in range(5):
         simulation_app.update()
 
     stage = omni.usd.get_context().get_stage()
-    setup_camera(stage)
     timeline = omni.timeline.get_timeline_interface()
+    timeline.play()
+    # play 後にレンダラーが完全に起動するまで待つ（render product 作成前に必須）
+    for _ in range(10):
+        simulation_app.update()
+
+    setup_camera(stage)
     translate_op = get_translate_op(stage, HUMANOID_PATH)
     rotate_op = get_rotate_z_op(stage, HUMANOID_PATH)
 
     rclpy.init()
     node = HumanoidSimNode()
-    timeline.play()
 
     print("[humanoid_ros2_sim] Running. Ctrl+C to stop.")
     try:
