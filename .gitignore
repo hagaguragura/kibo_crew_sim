@@ -6,3 +6,4 @@ install/
 log/
 *.db3
 *.bag
+.env
