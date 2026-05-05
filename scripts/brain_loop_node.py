@@ -48,13 +48,9 @@ MISSION = (
 def _make_twist(action: str) -> Twist:
     t = Twist()
     if action == "forward":
-        t.linear.x = 0.3
+        t.linear.y = 0.3   # +Y 方向（Int-Ball2 に向かう）
     elif action == "backward":
-        t.linear.x = -0.2
-    elif action == "left":
-        t.angular.z = 0.5
-    elif action == "right":
-        t.angular.z = -0.5
+        t.linear.y = -0.2  # -Y 方向
     return t
 
 
@@ -72,7 +68,7 @@ class BrainLoopNode(Node):
         self._latest_img: np.ndarray | None = None
         self._img_stamp: float = 0.0
 
-        self.odom_pos = {"x": 0.0, "y": 0.0, "z": 0.0, "yaw": 0.0}
+        self.odom_pos = {"x": 0.0, "y": 0.0, "z": 0.0}
         self.memory: list[str] = []
         self.cycle = 0
         self.reached = False
@@ -96,11 +92,7 @@ class BrainLoopNode(Node):
 
     def _odom_cb(self, msg: Odometry):
         p = msg.pose.pose.position
-        q = msg.pose.pose.orientation
-        # yaw from quaternion (rotation around Z only)
-        yaw_rad = 2.0 * math.atan2(q.z, q.w)
-        yaw_deg = math.degrees(yaw_rad)
-        self.odom_pos = {"x": p.x, "y": p.y, "z": p.z, "yaw": yaw_deg}
+        self.odom_pos = {"x": p.x, "y": p.y, "z": p.z}
 
     def get_latest_image(self) -> tuple[np.ndarray | None, float]:
         with self._img_lock:
@@ -169,7 +161,7 @@ class BrainLoopNode(Node):
                 f"loc={light['location']} {light['latency_ms']:.0f}ms"
             )
             if not light["visible"]:
-                action = "left"
+                action = "forward"
                 self.publish_action(action, self.cycle_sec)
                 return False
 

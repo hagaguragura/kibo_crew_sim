@@ -123,7 +123,6 @@ Mission:
 
 Current state:
 - Position: x={state.get('x', 0):.2f}, y={state.get('y', 0):.2f}, z={state.get('z', 0):.2f}
-- Heading: {state.get('yaw', 0):.1f} deg
 
 Recent memory (last cycles):
 {memory_lines}
@@ -136,19 +135,19 @@ Decide your single next action. Reply ONLY with this JSON object, no prose:
   "target_visible": true | false,
   "target_location": "left" | "right" | "center" | "none",
   "reasoning": "why this action (1-2 sentences)",
-  "action": "forward" | "backward" | "left" | "right" | "stay",
+  "action": "forward" | "backward" | "stay",
   "memory": "one short sentence to remember next cycle"
 }}
 
 Action semantics:
-- forward / backward: move along current heading (+X direction)
-- left / right: rotate in place (~30 degrees)
-- stay: stop (use when goal is reached or unsure)
+- forward: move toward Int-Ball2 (+Y direction)
+- backward: move away from Int-Ball2 (-Y direction)
+- stay: stop (use when within 1 meter of target)
 
 Decision rules (follow strictly):
-1. If target_visible=true → choose "forward" to approach. Do NOT rotate.
-2. If target_visible=false → choose "left" or "right" to scan.
-3. Choose "stay" ONLY when you have physically moved to within 1 meter of the target."""
+1. If target_visible=true AND far → choose "forward" to approach.
+2. If target_visible=true AND close (within 1m) → choose "stay".
+3. If target_visible=false → choose "forward" (target is ahead, keep moving)."""
 
         t0 = time.perf_counter()
         response = self.client.messages.create(

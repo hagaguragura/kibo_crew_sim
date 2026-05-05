@@ -12,7 +12,6 @@
 import sys
 import os
 import time
-import math
 import argparse
 import numpy as np
 
@@ -34,8 +33,7 @@ import omni.timeline
 import omni.graph.core as og
 import omni.replicator.core as rep
 from isaacsim.core.utils.stage import open_stage
-from spawn_intball import spawn_intball
-from pxr import Usd, UsdGeom, UsdLux, Gf
+from pxr import UsdGeom, UsdLux, Gf
 
 import rclpy
 from rclpy.node import Node
@@ -46,7 +44,6 @@ KIBOU_USD = os.path.expandvars(
     "$SPD_WS/src/int-ball2_isaac_sim/int-ball2_isaac_sim/assets/KIBOU_with_humanoid.usd"
 )
 HUMANOID_PATH = "/World/Humanoid_01"
-INTBALL2_PATH = "/World/IntBall2"
 INITIAL_POS = np.array([20.5, 0.0, 0.3])
 
 CAM_PATH = f"{HUMANOID_PATH}/HeadMount/Camera_01"
@@ -61,10 +58,8 @@ class HumanoidSimNode(Node):
     def __init__(self):
         super().__init__("humanoid_sim")
         self.position = INITIAL_POS.copy()
-        self.cmd_vel = np.zeros(3)
-        self.angular_z = 0.0
-        self.yaw = 0.0  # radians
-        self.dt = 1.0 / 10.0  # 10Hz に合わせる
+        self.linear_y = 0.0  # +Y 方向の速度のみ使用
+        self.dt = 1.0 / 10.0
 
         self.pub_odom = self.create_publisher(Odometry, "/humanoid_01/odom", 10)
         self.sub_cmd = self.create_subscription(
@@ -73,43 +68,29 @@ class HumanoidSimNode(Node):
         self.get_logger().info("HumanoidSimNode initialized.")
 
     def _cmd_vel_cb(self, msg: Twist):
-        self.cmd_vel = np.array([msg.linear.x, msg.linear.y, msg.linear.z])
-        self.angular_z = msg.angular.z
-        self.get_logger().info(
-            f"cmd_vel received: x={msg.linear.x:.2f} y={msg.linear.y:.2f} "
-            f"yaw_rate={msg.angular.z:.2f}"
-        )
+        self.linear_y = msg.linear.y
+        self.get_logger().info(f"cmd_vel received: y={msg.linear.y:.2f}")
 
-    def update(self, translate_op, rotate_op):
-        # 差動駆動: yaw 更新 → heading に沿って前進
-        self.yaw += self.angular_z * self.dt
-        linear_x = float(self.cmd_vel[0])
-        dx = math.cos(self.yaw) * linear_x * self.dt
-        dy = math.sin(self.yaw) * linear_x * self.dt
-        new_pos = self.position + np.array([dx, dy, 0.0])
+    def update(self, translate_op):
+        # +Y 方向のみの単純移動（回転なし）
+        dy = self.linear_y * self.dt
+        new_pos = self.position + np.array([0.0, dy, 0.0])
         new_pos[0] = float(np.clip(new_pos[0], X_MIN, X_MAX))
         new_pos[1] = float(np.clip(new_pos[1], Y_MIN, Y_MAX))
         new_pos[2] = Z
         self.position = new_pos
 
-        # USD更新: 位置 + 回転（カメラの向きに反映）
         if translate_op:
             translate_op.Set(Gf.Vec3d(*self.position))
-        if rotate_op:
-            rotate_op.Set(math.degrees(self.yaw))
 
-        # odom publish (yaw → quaternion: qw=cos(yaw/2), qz=sin(yaw/2))
-        half = self.yaw / 2.0
         msg = Odometry()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = "world"
         msg.pose.pose.position.x = float(self.position[0])
         msg.pose.pose.position.y = float(self.position[1])
         msg.pose.pose.position.z = float(self.position[2])
-        msg.pose.pose.orientation.w = math.cos(half)
-        msg.pose.pose.orientation.z = math.sin(half)
-        msg.twist.twist.linear.x = linear_x
-        msg.twist.twist.angular.z = self.angular_z
+        msg.pose.pose.orientation.w = 1.0  # 回転なし
+        msg.twist.twist.linear.y = self.linear_y
         self.pub_odom.publish(msg)
 
 
@@ -123,16 +104,6 @@ def get_translate_op(stage, prim_path):
             return op
     return xformable.AddTranslateOp()
 
-
-def get_rotate_z_op(stage, prim_path):
-    prim = stage.GetPrimAtPath(prim_path)
-    if not prim.IsValid():
-        return None
-    xformable = UsdGeom.Xformable(prim)
-    for op in xformable.GetOrderedXformOps():
-        if "rotateZ" in op.GetOpName():
-            return op
-    return xformable.AddRotateZOp()
 
 
 def setup_camera(stage):
@@ -186,21 +157,6 @@ def setup_camera(stage):
     print(f"[camera] /humanoid_01/image_raw ready ({CAM_RES[0]}x{CAM_RES[1]})")
 
 
-def freeze_intball(stage):
-    """Intball2.usd 内の RigidBody を kinematic に設定して位置固定する。
-    spawn_intball() 後に simulation_app.update() でリファレンスを解決してから呼ぶこと。
-    """
-    from pxr import UsdPhysics, Usd
-    root = stage.GetPrimAtPath(INTBALL2_PATH)
-    if not root.IsValid():
-        print("[freeze_intball] /World/IntBall2 not found, skipping.")
-        return
-    for prim in Usd.PrimRange(root):
-        if prim.HasAPI(UsdPhysics.RigidBodyAPI):
-            UsdPhysics.RigidBodyAPI(prim).CreateKinematicEnabledAttr(True)
-            print(f"[freeze_intball] kinematic=True: {prim.GetPath()}")
-
-
 def main():
     if not os.path.exists(KIBOU_USD):
         print(f"ERROR: {KIBOU_USD} not found.")
@@ -211,13 +167,9 @@ def main():
     simulation_app.update()
 
     stage = omni.usd.get_context().get_stage()
-    spawn_intball(stage)
-    simulation_app.update()   # リファレンス解決を待つ
-    freeze_intball(stage)     # 子prim の RigidBody を kinematic に固定
     setup_camera(stage)
     timeline = omni.timeline.get_timeline_interface()
     translate_op = get_translate_op(stage, HUMANOID_PATH)
-    rotate_op = get_rotate_z_op(stage, HUMANOID_PATH)
 
     rclpy.init()
     node = HumanoidSimNode()
@@ -226,11 +178,8 @@ def main():
     print("[humanoid_ros2_sim] Running. Ctrl+C to stop.")
     try:
         while simulation_app.is_running():
-            # cmd_vel を受信するために十分待つ
             rclpy.spin_once(node, timeout_sec=0.05)
-            # 位置更新 + odom publish
-            node.update(translate_op, rotate_op)
-            # Isaac Sim 描画
+            node.update(translate_op)
             simulation_app.update()
     except KeyboardInterrupt:
         pass
