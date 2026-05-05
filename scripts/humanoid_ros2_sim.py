@@ -49,8 +49,8 @@ INITIAL_POS = np.array([20.5, 0.0, 0.3])
 CAM_PATH = f"{HUMANOID_PATH}/HeadMount/Camera_01"
 CAM_RES  = (640, 480)
 
-X_MIN, X_MAX = 19.0, 22.0
-Y_MIN, Y_MAX = -1.0, 5.0
+X_MIN, X_MAX = 19.8, 21.2
+Y_MIN, Y_MAX = -0.3, 2.5
 Z = 0.3
 
 
@@ -93,8 +93,15 @@ class HumanoidSimNode(Node):
         dx = -np.sin(self.yaw) * self.linear_y * dt
         dy = np.cos(self.yaw) * self.linear_y * dt
         new_pos = self.position + np.array([dx, dy, 0.0])
-        new_pos[0] = float(np.clip(new_pos[0], X_MIN, X_MAX))
-        new_pos[1] = float(np.clip(new_pos[1], Y_MIN, Y_MAX))
+        cx = float(np.clip(new_pos[0], X_MIN, X_MAX))
+        cy = float(np.clip(new_pos[1], Y_MIN, Y_MAX))
+
+        # 境界に当たったら移動を止める（壁ずり防止）
+        if cx != new_pos[0] or cy != new_pos[1]:
+            self.linear_y = 0.0
+
+        new_pos[0] = cx
+        new_pos[1] = cy
         new_pos[2] = Z
         self.position = new_pos
 
