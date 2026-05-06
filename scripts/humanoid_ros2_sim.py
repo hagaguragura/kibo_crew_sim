@@ -148,17 +148,40 @@ def get_rotate_z_op(stage, prim_path):
 
 
 def setup_camera(stage):
-    # KIBOU interior: 6灯で全域をカバー
+    # viewportがGUI保存カメラを向いていると削除時クラッシュするのでPerspectiveに戻す
+    try:
+        from omni.kit.viewport.utility import get_active_viewport
+        vp = get_active_viewport()
+        if vp and str(vp.camera_path) != "/OmniverseKit_Persp":
+            print(f"[camera] resetting viewport: {vp.camera_path} → Perspective")
+            vp.camera_path = "/OmniverseKit_Persp"
+            simulation_app.update()
+    except Exception as e:
+        print(f"[camera] viewport reset skipped: {e}")
+
+    # 前回セッションのCameraGraphが残っていると衝突するので先に削除
+    graph_path = f"{HUMANOID_PATH}/CameraGraph"
+    if stage.GetPrimAtPath(graph_path).IsValid():
+        print(f"[camera] removing stale CameraGraph: {graph_path}")
+        stage.RemovePrim(graph_path)
+        simulation_app.update()
+
+    # KIBOU interior: 6灯で全域をカバー（TranslateOpが既存なら再利用）
     light_positions = [
-        (20.5, 0.0, 2.5), (20.5, 0.0, 0.5),  # 初期位置付近
-        (20.5, 2.0, 2.0), (20.5, 4.0, 2.0),   # Y+ 方向
-        (21.5, 1.0, 2.0), (19.5, 1.0, 2.0),   # X方向両端
+        (20.5, 0.0, 2.5), (20.5, 0.0, 0.5),
+        (20.5, 2.0, 2.0), (20.5, 4.0, 2.0),
+        (21.5, 1.0, 2.0), (19.5, 1.0, 2.0),
     ]
     for i, pos in enumerate(light_positions):
         sl = UsdLux.SphereLight.Define(stage, f"/World/KibouInteriorLight_{i}")
         sl.GetIntensityAttr().Set(8000)
         sl.GetRadiusAttr().Set(0.2)
-        UsdGeom.Xformable(sl.GetPrim()).AddTranslateOp().Set(Gf.Vec3d(*pos))
+        xf = UsdGeom.Xformable(sl.GetPrim())
+        t_op = next((op for op in xf.GetOrderedXformOps()
+                     if "translate" in op.GetOpName()), None)
+        if t_op is None:
+            t_op = xf.AddTranslateOp()
+        t_op.Set(Gf.Vec3d(*pos))
 
     head_mount = UsdGeom.Xform.Define(stage, f"{HUMANOID_PATH}/HeadMount")
     UsdGeom.XformCommonAPI(head_mount).SetTranslate(Gf.Vec3d(0.0, 0.12, 1.63))
@@ -167,7 +190,12 @@ def setup_camera(stage):
     cam.GetHorizontalApertureAttr().Set(20.955)
     cam.GetFocalLengthAttr().Set(18.147)
     cam.GetClippingRangeAttr().Set(Gf.Vec2f(0.05, 50.0))
-    UsdGeom.Xformable(cam.GetPrim()).AddRotateXOp().Set(90.0)
+    cam_xf = UsdGeom.Xformable(cam.GetPrim())
+    rx_op = next((op for op in cam_xf.GetOrderedXformOps()
+                  if "rotateX" in op.GetOpName()), None)
+    if rx_op is None:
+        rx_op = cam_xf.AddRotateXOp()
+    rx_op.Set(90.0)
 
     simulation_app.update()
 
@@ -196,6 +224,7 @@ def setup_camera(stage):
     )
     simulation_app.update()
     print(f"[camera] /humanoid_01/image_raw ready ({CAM_RES[0]}x{CAM_RES[1]})")
+    return rp
 
 
 def main():
@@ -215,7 +244,7 @@ def main():
     for _ in range(10):
         simulation_app.update()
 
-    setup_camera(stage)
+    rp = setup_camera(stage)
     translate_op = get_translate_op(stage, HUMANOID_PATH)
     rotate_op = get_rotate_z_op(stage, HUMANOID_PATH)
 
@@ -232,6 +261,11 @@ def main():
         pass
     finally:
         timeline.stop()
+        try:
+            rp.destroy()  # render product を先に解放してからclose（NULLクラッシュ回避）
+            simulation_app.update()
+        except Exception:
+            pass
         node.destroy_node()
         rclpy.shutdown()
         simulation_app.close()

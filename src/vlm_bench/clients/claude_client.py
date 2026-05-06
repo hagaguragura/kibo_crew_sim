@@ -113,16 +113,32 @@ class ClaudeVLMClient:
                sensors_now: dict | None = None,
                sensors_history: list[dict] | None = None,
                memory: list | None = None,
-               max_tokens: int = 500) -> dict:
-        """v0.5: image + mission + state + sensors + memory -> action JSON."""
+               action_history: list[dict] | None = None,
+               max_tokens: int = 600) -> dict:
+        """v0.5: image + mission + state + sensors + memory + action_history -> action JSON."""
         _, buf = cv2.imencode(".jpg", image_bgr)
         b64 = base64.standard_b64encode(buf.tobytes()).decode("utf-8")
 
         memory = memory or []
         sensors_now = sensors_now or {}
         sensors_history = sensors_history or []
+        action_history = action_history or []
 
+        # Previous Memory — self-feedback from past cycles
         memory_lines = "\n".join(f"- {m}" for m in memory) if memory else "None"
+
+        # Action history block — lets Claude see its own behavioral pattern
+        if action_history:
+            rows = []
+            for e in action_history:
+                comms_note = " [sent, no reply]" if e.get("comms_sent") else ""
+                rows.append(
+                    f"  cy{e['cycle']:02d}: {e['action']:<14} pos=({e['x']:.1f},{e['y']:.1f})"
+                    f" [{e['concern']}]{comms_note}"
+                )
+            action_history_block = "[Action History — recent cycles]\n" + "\n".join(rows)
+        else:
+            action_history_block = ""
 
         if sensors_now:
             o2 = sensors_now.get("o2_percent", 21.0)
@@ -152,10 +168,13 @@ Mission:
 Current state:
 - Position: x={state.get('x', 0):.2f}, y={state.get('y', 0):.2f}
 - Heading: {state.get('yaw_deg', 0):.0f}° (0°=+Y forward, 90°=-X left)
+- Movable range: X(19.8–21.2) Y(-0.3–2.5)
 {sensors_block}
 
-Recent memory (last cycles):
+[Previous Memory — your self-feedback from past cycles]
 {memory_lines}
+
+{action_history_block}
 
 The attached image is your current first-person view.
 
@@ -167,7 +186,7 @@ Decide your single next action. Reply ONLY with this JSON, no prose:
   "concern_level": "calm" | "alert" | "concerned" | "alarmed",
   "action": "move_forward" | "move_backward" | "turn_left" | "turn_right" | "inspect" | "communicate" | "report_status",
   "communicate_text": "message to ground (only if action=communicate, else empty string)",
-  "memory": "one short sentence to remember next cycle"
+  "memory": "what I tried, what happened, and what I will do differently next cycle"
 }}
 
 Action semantics:
@@ -179,7 +198,7 @@ Action semantics:
 - communicate: send a message to ground control (fill communicate_text)
 - report_status: internal status log (no movement)
 
-Exploration guidance: vary your actions — combine turning and moving to explore different directions."""
+Survival guidance: review your Action History before deciding. If a strategy has not worked for several cycles, change it."""
 
         t0 = time.perf_counter()
         response = self.client.messages.create(

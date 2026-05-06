@@ -90,6 +90,7 @@ class BrainLoopNode(Node):
 
         self.odom_pos = {"x": 0.0, "y": 0.0, "z": 0.0, "yaw_deg": 0.0}
         self.memory: list[str] = []
+        self.action_history: list[dict] = []
         self.cycle = 0
         self.reached = False
         self.total_cost = 0.0
@@ -183,6 +184,7 @@ class BrainLoopNode(Node):
             sensors_now=sensors_now or {},
             sensors_history=sensors_history or [],
             memory=self.memory[-5:],
+            action_history=self.action_history[-8:],
         )
         result["image_age_ms"] = age_ms
         self.total_cost += result["cost_usd"]
@@ -198,6 +200,7 @@ class BrainLoopNode(Node):
         if result.get("interpretation"):
             logger.info(f"  int: {result.get('interpretation','')[:80]}")
 
+        comms_sent = False
         if action == "communicate":
             text = result.get("communicate_text", "")
             if text:
@@ -205,8 +208,22 @@ class BrainLoopNode(Node):
                 self.comms_log.append({"cycle": self.cycle, "text": text,
                                        "timestamp": datetime.utcnow().isoformat()})
                 logger.info(f"  comms: {text[:80]}")
+                comms_sent = True
 
-        self.memory.append(result.get("memory", ""))
+        self.action_history.append({
+            "cycle": self.cycle,
+            "action": action,
+            "x": state["x"],
+            "y": state["y"],
+            "concern": concern,
+            "comms_sent": comms_sent,
+        })
+        # parseエラー時は直前のmemoryを保持（上書きしない）
+        new_mem = result.get("memory", "")
+        if new_mem and new_mem != "parse error":
+            self.memory.append(new_mem)
+        elif self.memory:
+            self.memory.append(self.memory[-1])  # 直前をコピーして継続
         self.log_cycle(img, result, sensors_now)
         self.publish_action(action, self.cycle_sec)
         return False
@@ -217,12 +234,15 @@ def main():
     parser.add_argument("--cycle", type=float,
                         default=float(os.environ.get("SPD_BRAIN_CYCLE_SEC", "5")))
     parser.add_argument("--timeout", type=float, default=600.0)
-    parser.add_argument("--log-dir", type=str,
-                        default=os.path.expandvars(
-                            f"$SPD_RUNS/v0.5/{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}"))
+    parser.add_argument("--tag", type=str, default="",
+                        help="Run label appended to directory name (e.g. run1, run2)")
+    parser.add_argument("--log-dir", type=str, default=None)
     args, _ = parser.parse_known_args()
 
-    log_dir = Path(args.log_dir)
+    ts = datetime.utcnow().strftime('%Y%m%dT%H%M%S')
+    suffix = f"_{args.tag}" if args.tag else ""
+    log_dir = Path(args.log_dir) if args.log_dir else \
+              Path(os.path.expandvars(f"$SPD_RUNS/v0.5/{ts}{suffix}"))
     log_dir.mkdir(parents=True, exist_ok=True)
 
     model = os.environ.get("SPD_VLM_MODEL", "claude-sonnet-4-6")
