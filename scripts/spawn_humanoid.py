@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Phase 1.2: KIBOUシーンにヒューマノイド（Capsule Prim）を配置してUSDを保存する。
+"""Phase 1.2: KIBOUシーンにヒューマノイド（球+円柱）を配置してUSDを保存する。
 
 使用方法:
     $SPD_ISAACSIM_PATH/python.sh spawn_humanoid.py [--headless]
@@ -19,7 +19,6 @@ simulation_app = SimulationApp({"headless": args.headless, "renderer": "Raytrace
 
 import omni.usd
 from isaacsim.core.utils.stage import open_stage, save_stage
-from isaacsim.core.utils.extensions import enable_extension
 from pxr import Usd, UsdGeom, Gf
 
 # --- 設定 ---
@@ -31,15 +30,27 @@ OUTPUT_USD = os.path.expandvars(
 )
 HUMANOID_PRIM_PATH = "/World/Humanoid_01"
 
-# KIBOU world座標内、モジュール内ハッチ前の床面付近
-# KIBOU center: (20, 0, 0), Int-Ball2 initial: (20.17, 3.06, 2.21)
-# 床面: Z ~0.8（Int-Ball2のXY飛行高度Z~2.21から下の床面付近）
-HUMANOID_POS = Gf.Vec3d(20.5, 0.5, 0.8)
+POINT_A = Gf.Vec3d(20.5, 0.0, 0.3)
 
-# Capsule パラメータ（人体近似: 全高~1.6m）
-CAPSULE_RADIUS = 0.25   # m
-CAPSULE_HEIGHT = 1.1    # m（cylinderパート）
-CAPSULE_AXIS   = "Z"
+SKIN = (0.85, 0.72, 0.60)
+SUIT = (0.25, 0.40, 0.65)
+BOOT = (0.25, 0.25, 0.25)
+
+
+def _sph(stage, path, r, pos, color=None):
+    s = UsdGeom.Sphere.Define(stage, path)
+    s.GetRadiusAttr().Set(r)
+    UsdGeom.Xformable(s.GetPrim()).AddTranslateOp().Set(Gf.Vec3d(*pos))
+    s.GetDisplayColorAttr().Set([Gf.Vec3f(*(color or SKIN))])
+
+
+def _cyl(stage, path, r, h, pos, color=None):
+    c = UsdGeom.Cylinder.Define(stage, path)
+    c.GetRadiusAttr().Set(r)
+    c.GetHeightAttr().Set(h)
+    c.GetAxisAttr().Set(UsdGeom.Tokens.z)
+    UsdGeom.Xformable(c.GetPrim()).AddTranslateOp().Set(Gf.Vec3d(*pos))
+    c.GetDisplayColorAttr().Set([Gf.Vec3f(*(color or SUIT))])
 
 
 def main():
@@ -49,30 +60,36 @@ def main():
         simulation_app.close()
         sys.exit(1)
 
-    result = open_stage(KIBOU_USD)
-    if not result:
+    if not open_stage(KIBOU_USD):
         print("ERROR: open_stage failed")
         simulation_app.close()
         sys.exit(1)
 
     simulation_app.update()
-
     stage = omni.usd.get_context().get_stage()
 
-    # --- ヒューマノイドXformを作成 ---
-    print(f"[spawn_humanoid] Creating prim: {HUMANOID_PRIM_PATH}")
-    xform_prim = UsdGeom.Xform.Define(stage, HUMANOID_PRIM_PATH)
-    xform_prim.AddTranslateOp().Set(HUMANOID_POS)
+    # --- Humanoid_01 ルートXform ---
+    B = HUMANOID_PRIM_PATH
+    humanoid = UsdGeom.Xform.Define(stage, B)
+    humanoid.AddTranslateOp().Set(POINT_A)
 
-    # --- Capsule（ヒューマノイドの代替形状）を追加 ---
-    capsule_path = f"{HUMANOID_PRIM_PATH}/Body"
-    capsule = UsdGeom.Capsule.Define(stage, capsule_path)
-    capsule.GetRadiusAttr().Set(CAPSULE_RADIUS)
-    capsule.GetHeightAttr().Set(CAPSULE_HEIGHT)
-    capsule.GetAxisAttr().Set(CAPSULE_AXIS)
+    # --- 身体パーツ（ローカルZ: 足元=0、頭頂~1.75m）---
+    _sph(stage, f"{B}/Head",           0.12,         (0.00, 0.00, 1.63))
+    _cyl(stage, f"{B}/Neck",           0.05, 0.12,   (0.00, 0.00, 1.49))
+    _cyl(stage, f"{B}/Torso",          0.17, 0.55,   (0.00, 0.00, 1.12))
+    _cyl(stage, f"{B}/Pelvis",         0.14, 0.18,   (0.00, 0.00, 0.74))
+    _cyl(stage, f"{B}/LeftUpperArm",   0.05, 0.28,   (-0.22, 0.00, 1.12))
+    _cyl(stage, f"{B}/RightUpperArm",  0.05, 0.28,   ( 0.22, 0.00, 1.12))
+    _cyl(stage, f"{B}/LeftForearm",    0.04, 0.24,   (-0.22, 0.00, 0.86))
+    _cyl(stage, f"{B}/RightForearm",   0.04, 0.24,   ( 0.22, 0.00, 0.86))
+    _cyl(stage, f"{B}/LeftUpperLeg",   0.07, 0.38,   (-0.10, 0.00, 0.48))
+    _cyl(stage, f"{B}/RightUpperLeg",  0.07, 0.38,   ( 0.10, 0.00, 0.48))
+    _cyl(stage, f"{B}/LeftLowerLeg",   0.06, 0.32,   (-0.10, 0.00, 0.16), color=BOOT)
+    _cyl(stage, f"{B}/RightLowerLeg",  0.06, 0.32,   ( 0.10, 0.00, 0.16), color=BOOT)
 
-    # 色: 緑（目視確認しやすいよう）
-    capsule.GetDisplayColorAttr().Set([(0.1, 0.8, 0.2)])
+    # --- HeadMount: カメラアタッチメントポイント（USDに含める）---
+    head_mount = UsdGeom.Xform.Define(stage, f"{B}/HeadMount")
+    UsdGeom.XformCommonAPI(head_mount).SetTranslate(Gf.Vec3d(0.0, 0.12, 1.63))
 
     # --- 保存 ---
     print(f"[spawn_humanoid] Saving: {OUTPUT_USD}")

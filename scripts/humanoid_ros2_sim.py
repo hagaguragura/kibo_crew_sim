@@ -12,10 +12,17 @@
 import sys
 import os
 import time
+import argparse
 import numpy as np
 
+sys.path.insert(0, os.path.dirname(__file__))
+
+_parser = argparse.ArgumentParser()
+_parser.add_argument("--headless", action="store_true", default=False)
+_args, _ = _parser.parse_known_args()
+
 from isaacsim import SimulationApp
-simulation_app = SimulationApp({"headless": True, "renderer": "RaytracedLighting"})
+simulation_app = SimulationApp({"headless": _args.headless, "renderer": "RaytracedLighting"})
 
 from isaacsim.core.utils.extensions import enable_extension
 enable_extension("isaacsim.ros2.bridge")
@@ -23,8 +30,10 @@ simulation_app.update()
 
 import omni.usd
 import omni.timeline
+import omni.graph.core as og
+import omni.replicator.core as rep
 from isaacsim.core.utils.stage import open_stage
-from pxr import Usd, UsdGeom, Gf
+from pxr import UsdGeom, UsdLux, Gf
 
 import rclpy
 from rclpy.node import Node
@@ -35,19 +44,28 @@ KIBOU_USD = os.path.expandvars(
     "$SPD_WS/src/int-ball2_isaac_sim/int-ball2_isaac_sim/assets/KIBOU_with_humanoid.usd"
 )
 HUMANOID_PATH = "/World/Humanoid_01"
-INITIAL_POS = np.array([20.5, 0.5, 0.8])
+INITIAL_POS = np.array([20.5, 0.0, 0.3])
 
-X_MIN, X_MAX = 19.0, 22.0
-Y_MIN, Y_MAX = -1.0, 5.0
-Z = 0.8
+CAM_PATH = f"{HUMANOID_PATH}/HeadMount/Camera_01"
+CAM_RES  = (640, 480)
+
+X_MIN, X_MAX = 19.8, 21.2
+Y_MIN, Y_MAX = -0.3, 2.5
+Z = 0.3
 
 
 class HumanoidSimNode(Node):
+    CMD_VEL_TIMEOUT = 0.5  # cmd_vel が来なくなったら0.5秒で自動停止
+
     def __init__(self):
         super().__init__("humanoid_sim")
         self.position = INITIAL_POS.copy()
-        self.cmd_vel = np.zeros(3)
-        self.dt = 1.0 / 10.0  # 10Hz に合わせる
+        self.linear_y = 0.0
+        self.angular_z = 0.0
+        self.yaw = 0.0  # ラジアン、初期は +Y 方向
+        self.dt = 1.0 / 10.0
+        self._last_cmd_time = 0.0
+        self._last_update_time = time.monotonic()
 
         self.pub_odom = self.create_publisher(Odometry, "/humanoid_01/odom", 10)
         self.sub_cmd = self.create_subscription(
@@ -56,34 +74,53 @@ class HumanoidSimNode(Node):
         self.get_logger().info("HumanoidSimNode initialized.")
 
     def _cmd_vel_cb(self, msg: Twist):
-        self.cmd_vel = np.array([msg.linear.x, msg.linear.y, msg.linear.z])
-        self.get_logger().info(
-            f"cmd_vel received: x={msg.linear.x:.2f} y={msg.linear.y:.2f}"
-        )
+        self.linear_y = msg.linear.y
+        self.angular_z = msg.angular.z
+        self._last_cmd_time = time.monotonic()
+        self.get_logger().info(f"cmd_vel received: y={msg.linear.y:.2f} az={msg.angular.z:.2f}")
 
-    def update(self, translate_op):
-        # 位置更新
-        delta = self.cmd_vel * self.dt
-        new_pos = self.position + delta
-        new_pos[0] = float(np.clip(new_pos[0], X_MIN, X_MAX))
-        new_pos[1] = float(np.clip(new_pos[1], Y_MIN, Y_MAX))
+    def update(self, translate_op, rotate_op):
+        now = time.monotonic()
+        dt = min(now - self._last_update_time, 0.2)  # 最大200msでキャップ
+        self._last_update_time = now
+
+        if self._last_cmd_time > 0 and now - self._last_cmd_time > self.CMD_VEL_TIMEOUT:
+            self.linear_y = 0.0
+            self.angular_z = 0.0
+
+        self.yaw = np.fmod(self.yaw + self.angular_z * dt, 2 * np.pi)
+
+        dx = -np.sin(self.yaw) * self.linear_y * dt
+        dy = np.cos(self.yaw) * self.linear_y * dt
+        new_pos = self.position + np.array([dx, dy, 0.0])
+        cx = float(np.clip(new_pos[0], X_MIN, X_MAX))
+        cy = float(np.clip(new_pos[1], Y_MIN, Y_MAX))
+
+        # 境界に当たったら移動を止める（壁ずり防止）
+        if cx != new_pos[0] or cy != new_pos[1]:
+            self.linear_y = 0.0
+
+        new_pos[0] = cx
+        new_pos[1] = cy
         new_pos[2] = Z
         self.position = new_pos
 
-        # USD更新
         if translate_op:
             translate_op.Set(Gf.Vec3d(*self.position))
+        if rotate_op:
+            rotate_op.Set(float(np.degrees(self.yaw)))
 
-        # odom publish
+        yaw_half = self.yaw / 2.0
         msg = Odometry()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = "world"
         msg.pose.pose.position.x = float(self.position[0])
         msg.pose.pose.position.y = float(self.position[1])
         msg.pose.pose.position.z = float(self.position[2])
-        msg.pose.pose.orientation.w = 1.0
-        msg.twist.twist.linear.x = float(self.cmd_vel[0])
-        msg.twist.twist.linear.y = float(self.cmd_vel[1])
+        msg.pose.pose.orientation.z = float(np.sin(yaw_half))
+        msg.pose.pose.orientation.w = float(np.cos(yaw_half))
+        msg.twist.twist.linear.y = self.linear_y
+        msg.twist.twist.angular.z = self.angular_z
         self.pub_odom.publish(msg)
 
 
@@ -98,6 +135,98 @@ def get_translate_op(stage, prim_path):
     return xformable.AddTranslateOp()
 
 
+def get_rotate_z_op(stage, prim_path):
+    prim = stage.GetPrimAtPath(prim_path)
+    if not prim.IsValid():
+        return None
+    xformable = UsdGeom.Xformable(prim)
+    for op in xformable.GetOrderedXformOps():
+        if "rotateZ" in op.GetOpName():
+            return op
+    return xformable.AddRotateZOp()
+
+
+
+def setup_camera(stage):
+    # viewportがGUI保存カメラを向いていると削除時クラッシュするのでPerspectiveに戻す
+    try:
+        from omni.kit.viewport.utility import get_active_viewport
+        vp = get_active_viewport()
+        if vp and str(vp.camera_path) != "/OmniverseKit_Persp":
+            print(f"[camera] resetting viewport: {vp.camera_path} → Perspective")
+            vp.camera_path = "/OmniverseKit_Persp"
+            simulation_app.update()
+    except Exception as e:
+        print(f"[camera] viewport reset skipped: {e}")
+
+    # 前回セッションのCameraGraphが残っていると衝突するので先に削除
+    graph_path = f"{HUMANOID_PATH}/CameraGraph"
+    if stage.GetPrimAtPath(graph_path).IsValid():
+        print(f"[camera] removing stale CameraGraph: {graph_path}")
+        stage.RemovePrim(graph_path)
+        simulation_app.update()
+
+    # KIBOU interior: 6灯で全域をカバー（TranslateOpが既存なら再利用）
+    light_positions = [
+        (20.5, 0.0, 2.5), (20.5, 0.0, 0.5),
+        (20.5, 2.0, 2.0), (20.5, 4.0, 2.0),
+        (21.5, 1.0, 2.0), (19.5, 1.0, 2.0),
+    ]
+    for i, pos in enumerate(light_positions):
+        sl = UsdLux.SphereLight.Define(stage, f"/World/KibouInteriorLight_{i}")
+        sl.GetIntensityAttr().Set(8000)
+        sl.GetRadiusAttr().Set(0.2)
+        xf = UsdGeom.Xformable(sl.GetPrim())
+        t_op = next((op for op in xf.GetOrderedXformOps()
+                     if "translate" in op.GetOpName()), None)
+        if t_op is None:
+            t_op = xf.AddTranslateOp()
+        t_op.Set(Gf.Vec3d(*pos))
+
+    head_mount = UsdGeom.Xform.Define(stage, f"{HUMANOID_PATH}/HeadMount")
+    UsdGeom.XformCommonAPI(head_mount).SetTranslate(Gf.Vec3d(0.0, 0.12, 1.63))
+
+    cam = UsdGeom.Camera.Define(stage, CAM_PATH)
+    cam.GetHorizontalApertureAttr().Set(20.955)
+    cam.GetFocalLengthAttr().Set(18.147)
+    cam.GetClippingRangeAttr().Set(Gf.Vec2f(0.05, 50.0))
+    cam_xf = UsdGeom.Xformable(cam.GetPrim())
+    rx_op = next((op for op in cam_xf.GetOrderedXformOps()
+                  if "rotateX" in op.GetOpName()), None)
+    if rx_op is None:
+        rx_op = cam_xf.AddRotateXOp()
+    rx_op.Set(90.0)
+
+    simulation_app.update()
+
+    rp = rep.create.render_product(CAM_PATH, CAM_RES)
+    keys = og.Controller.Keys
+    og.Controller.edit(
+        {"graph_path": f"{HUMANOID_PATH}/CameraGraph", "evaluator_name": "push"},
+        {
+            keys.CREATE_NODES: [
+                ("OnTick",    "omni.graph.action.OnPlaybackTick"),
+                ("ROSCtx",    "isaacsim.ros2.bridge.ROS2Context"),
+                ("CamHelper", "isaacsim.ros2.bridge.ROS2CameraHelper"),
+            ],
+            keys.CONNECT: [
+                ("OnTick.outputs:tick",    "CamHelper.inputs:execIn"),
+                ("ROSCtx.outputs:context", "CamHelper.inputs:context"),
+            ],
+            keys.SET_VALUES: [
+                ("CamHelper.inputs:topicName",         "/humanoid_01/image_raw"),
+                ("CamHelper.inputs:frameId",           "humanoid_01_camera"),
+                ("CamHelper.inputs:type",              "rgb"),
+                ("CamHelper.inputs:renderProductPath", rp.path),
+                ("ROSCtx.inputs:domain_id",            0),
+            ],
+        },
+    )
+    simulation_app.update()
+    print(f"[camera] /humanoid_01/image_raw ready ({CAM_RES[0]}x{CAM_RES[1]})")
+    return rp
+
+
 def main():
     if not os.path.exists(KIBOU_USD):
         print(f"ERROR: {KIBOU_USD} not found.")
@@ -105,29 +234,38 @@ def main():
         sys.exit(1)
 
     open_stage(KIBOU_USD)
-    simulation_app.update()
+    for _ in range(5):
+        simulation_app.update()
 
     stage = omni.usd.get_context().get_stage()
     timeline = omni.timeline.get_timeline_interface()
+    timeline.play()
+    # play 後にレンダラーが完全に起動するまで待つ（render product 作成前に必須）
+    for _ in range(10):
+        simulation_app.update()
+
+    rp = setup_camera(stage)
     translate_op = get_translate_op(stage, HUMANOID_PATH)
+    rotate_op = get_rotate_z_op(stage, HUMANOID_PATH)
 
     rclpy.init()
     node = HumanoidSimNode()
-    timeline.play()
 
     print("[humanoid_ros2_sim] Running. Ctrl+C to stop.")
     try:
         while simulation_app.is_running():
-            # cmd_vel を受信するために十分待つ
             rclpy.spin_once(node, timeout_sec=0.05)
-            # 位置更新 + odom publish
-            node.update(translate_op)
-            # Isaac Sim 描画
+            node.update(translate_op, rotate_op)
             simulation_app.update()
     except KeyboardInterrupt:
         pass
     finally:
         timeline.stop()
+        try:
+            rp.destroy()  # render product を先に解放してからclose（NULLクラッシュ回避）
+            simulation_app.update()
+        except Exception:
+            pass
         node.destroy_node()
         rclpy.shutdown()
         simulation_app.close()

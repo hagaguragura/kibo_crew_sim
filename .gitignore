@@ -6,3 +6,9 @@ install/
 log/
 *.db3
 *.bag
+.env
+
+# 動画ファイル（重いのでgit管理外）
+*.mp4
+*.avi
+*.mov
